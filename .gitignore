@@ -1,0 +1,52 @@
+# ── Secrets — never commit ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.keystore
+*.jks
+key.properties
+**/serviceAccount*.json
+
+# Note: google-services.json and firebase_options.dart ARE committed. Those hold
+# client-side Firebase identifiers that ship inside every build and are not secrets.
+# The credentials that matter — service-account JSON and FCM server keys — stay
+# ignored above. Access is governed by Firebase Security Rules and App Check.
+
+# Has its own repository: github.com/and222row/yala-nsafr-website
+website/
+
+# ── Dependencies & build output ───────────────────────────────────────────────
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+*.iml
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/ios/Pods/
+mobile/ios/.symlinks/
+
+# ── Local database / infra ───────────────────────────────────────────────────
+pgdata/
+*.sql.bak
+
+# ── Logs & temp ───────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+yarn-error.log*
+server.log
+
+# ── Editor / OS ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

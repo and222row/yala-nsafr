@@ -1,0 +1,2 @@
+-dontwarn com.stripe.android.pushProvisioning.PushProvisioningActivity$f
+-dontwarn com.stripe.android.pushProvisioning.**

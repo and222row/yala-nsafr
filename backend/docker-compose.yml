@@ -1,0 +1,23 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: yala_nsafr_db
+    environment:
+      POSTGRES_DB: yala_nsafr
+      POSTGRES_USER: yala_user
+      POSTGRES_PASSWORD: yala_pass
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: yala_nsafr_redis
+    ports:
+      - '6379:6379'
+
+volumes:
+  pgdata:

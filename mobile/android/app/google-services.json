@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "341297849403",
+    "project_id": "yala-nsafr",
+    "storage_bucket": "yala-nsafr.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:341297849403:android:57077c64c2f5f9be86e81e",
+        "android_client_info": {
+          "package_name": "com.yalansafr.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAbMUn0FJm80LSXP1aAJBg0q2Bf4Z-kDsk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:341297849403:android:e6d17e7b924d699c86e81e",
+        "android_client_info": {
+          "package_name": "com.yalansafr.yala_nsafr"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAbMUn0FJm80LSXP1aAJBg0q2Bf4Z-kDsk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
