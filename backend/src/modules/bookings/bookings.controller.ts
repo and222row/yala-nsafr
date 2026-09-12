@@ -45,8 +45,9 @@ export class BookingsController {
   healPayment(
     @Param('id', ParseUUIDPipe) id: string,
     @Body('kashierOrderId') kashierOrderId: string,
+    @CurrentUser() user: User,
   ) {
-    return this.bookingsService.healFromRedirect(id, kashierOrderId);
+    return this.bookingsService.healFromRedirect(id, kashierOrderId, user);
   }
 
   @Patch(':id/approve')

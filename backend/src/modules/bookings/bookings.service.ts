@@ -718,16 +718,46 @@ export class BookingsService {
     return booking;
   }
 
-  // Called from in-app WebView: Kashier's real orderId extracted from the redirect URL params
-  async healFromRedirect(bookingId: string, kashierOrderId: string): Promise<{ healed: boolean }> {
+  // Called from the in-app WebView after it intercepts Kashier's payment redirect.
+  //
+  // The caller controls both arguments, so neither is evidence of payment: without the
+  // ownership check any signed-in user could heal someone else's booking, and without
+  // asking Kashier directly an invented orderId would mark an unpaid booking as paid.
+  // Kashier's own guidance is to confirm every payment server-side before releasing
+  // goods, so the redirect only triggers the check — it never supplies the answer.
+  async healFromRedirect(
+    bookingId: string,
+    kashierOrderId: string,
+    passenger: User,
+  ): Promise<{ healed: boolean }> {
     const booking = await this.bookingRepo.findOne({
       where: { id: bookingId },
       relations: { payment: true, trip: true },
     });
     if (!booking) return { healed: false };
+
+    if (booking.passengerId !== passenger.id) {
+      throw new ForbiddenException('Not your booking');
+    }
+
     if (booking.payment) {
       booking.payment.gatewayTransactionId = kashierOrderId;
       if (booking.status === BookingStatus.PENDING_PAYMENT) {
+        const kashierStatus = await this.kashier.getPaymentStatus(
+          booking.payment.gatewaySessionId,
+        );
+        const paid =
+          kashierStatus === 'AUTHORIZED' ||
+          kashierStatus === 'CAPTURED' ||
+          kashierStatus === 'SUCCESS';
+        if (!paid) {
+          this.logger.warn(
+            `healFromRedirect refused for booking ${bookingId}: Kashier reports ` +
+              `${kashierStatus ?? 'unknown'} for session ${booking.payment.gatewaySessionId ?? 'none'}`,
+          );
+          await this.bookingRepo.manager.save(Payment, booking.payment);
+          return { healed: false };
+        }
         booking.payment.status = PaymentStatus.PENDING;
         await this.bookingRepo.manager.save(Payment, booking.payment);
         booking.status = BookingStatus.PENDING_DRIVER_APPROVAL;

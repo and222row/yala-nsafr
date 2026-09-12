@@ -166,6 +166,7 @@ export class TripsService {
     };
   }
 
+  /** Full entity, including the driver's private columns. Internal callers only. */
   async findById(id: string): Promise<Trip> {
     const trip = await this.tripRepo.findOne({
       where: { id },
@@ -175,8 +176,19 @@ export class TripsService {
     return trip;
   }
 
+  /**
+   * What the trip-detail endpoint returns. Returning the raw entity handed every
+   * viewer the driver's national ID number and photo, emergency contacts and FCM
+   * token — formatTrip narrows it to the same public fields search already uses.
+   */
+  async findByIdPublic(id: string) {
+    return this.formatTrip(await this.findById(id));
+  }
+
   async cancel(tripId: string, driver: User, reason?: string): Promise<Trip> {
-    return this.dataSource.transaction(async (manager) => {
+    const paymentsToRefund: string[] = [];
+
+    const saved = await this.dataSource.transaction(async (manager) => {
       const trip = await manager.findOne(Trip, { where: { id: tripId } });
       if (!trip) throw new NotFoundException('Trip not found');
       if (trip.driverId !== driver.id) {
@@ -198,18 +210,12 @@ export class TripsService {
 
       const passengerIds: string[] = [];
       for (const booking of bookings) {
+        // Payment state is deliberately left alone here. Kashier has to be called to
+        // actually return the money, and a network call inside this transaction would
+        // hold locks — and could leave the DB claiming REFUNDED when nothing moved.
+        // Collected now, settled after the transaction commits.
         if (booking.payment && !booking.payment.isCash) {
-          if (booking.payment.status === PaymentStatus.CAPTURED) {
-            booking.payment.status = PaymentStatus.REFUNDED;
-            booking.payment.refundedAt = new Date();
-            booking.payment.refundAmount = booking.payment.amount;
-            await manager.save(Payment, booking.payment);
-          } else if (booking.payment.status === PaymentStatus.PENDING) {
-            // Authorized but not captured — release the hold
-            booking.payment.status = PaymentStatus.RELEASED;
-            booking.payment.releasedAt = new Date();
-            await manager.save(Payment, booking.payment);
-          }
+          paymentsToRefund.push(booking.payment.id);
         }
         booking.status = BookingStatus.REFUNDED;
         booking.cancelledAt = new Date();
@@ -236,6 +242,48 @@ export class TripsService {
 
       return saved;
     });
+
+    await this.returnFundsForPayments(paymentsToRefund, `trip ${tripId} cancelled by driver`);
+
+    return saved;
+  }
+
+  /**
+   * Actually returns passengers' money for cancelled bookings: a hold that was only
+   * authorized is voided, a captured payment is refunded in full. Runs after the
+   * cancelling transaction has committed, so the seats are freed even if the gateway is
+   * unreachable — a payment that fails here keeps its current status and is logged, so
+   * it stays visible for a retry rather than being recorded as refunded regardless.
+   */
+  private async returnFundsForPayments(paymentIds: string[], context: string): Promise<void> {
+    if (paymentIds.length === 0) return;
+
+    const payments = await this.paymentRepo.findBy({ id: In(paymentIds) });
+    for (const payment of payments) {
+      if (payment.isCash) continue;
+      const orderId = payment.gatewayTransactionId ?? payment.gatewayOrderId;
+      if (!orderId) continue;
+
+      try {
+        if (payment.status === PaymentStatus.PENDING) {
+          await this.kashier.releasePayment(orderId, payment.kashierTransactionId ?? undefined);
+          payment.status = PaymentStatus.RELEASED;
+          payment.releasedAt = new Date();
+        } else if (payment.status === PaymentStatus.CAPTURED) {
+          await this.kashier.refundPayment(orderId, Number(payment.amount));
+          payment.status = PaymentStatus.REFUNDED;
+          payment.refundAmount = Number(payment.amount);
+          payment.refundedAt = new Date();
+        } else {
+          continue;
+        }
+        await this.paymentRepo.save(payment);
+      } catch (err) {
+        this.logger.error(
+          `Failed to return funds for payment ${payment.id} (${context}, status ${payment.status}): ${err}`,
+        );
+      }
+    }
   }
 
   async startTrip(tripId: string, driver: User): Promise<Trip> {

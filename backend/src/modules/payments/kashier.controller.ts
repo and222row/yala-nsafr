@@ -39,7 +39,21 @@ export class KashierController {
           if (kashierInternalId && kashierInternalId !== merchantOrderId) {
             payment.gatewayTransactionId = kashierInternalId;
           }
-          if (status === 'SUCCESS' || status === 'AUTHORIZED') {
+          // This endpoint is public and unauthenticated — it has to be, because Kashier
+          // redirects the customer's browser here. The query string is therefore
+          // attacker-controlled: anyone could request it with status=SUCCESS for someone
+          // else's order. Ask Kashier what actually happened instead of believing it.
+          const verified = await this.kashierService.getPaymentStatus(payment.gatewaySessionId);
+          const reallyPaid = verified === 'AUTHORIZED' || verified === 'CAPTURED' || verified === 'SUCCESS';
+
+          if ((status === 'SUCCESS' || status === 'AUTHORIZED') && !reallyPaid) {
+            this.logger.warn(
+              `payment-done claimed ${status} for ${merchantOrderId} but Kashier reports ` +
+                `${verified ?? 'unknown'} — ignoring`,
+            );
+          }
+
+          if (reallyPaid) {
             const booking = await this.bookingRepo.findOne({ where: { id: payment.bookingId } });
             if (booking && booking.status === BookingStatus.PENDING_PAYMENT) {
               payment.status = PaymentStatus.PENDING;
@@ -135,10 +149,27 @@ h2{color:#16a34a;font-size:2rem;margin-bottom:12px}p{color:#555;font-size:1.1rem
     payment.gatewayResponse = body as any;
 
     const nextStatus = this.paymentStatusFor(event, status);
+    const succeeded = status === 'SUCCESS';
 
-    // Idempotency: Kashier retries up to 10 times and replays events. 409 tells it to
-    // stop; re-applying would risk double-processing a payment.
-    if (nextStatus && payment.status === nextStatus) {
+    // Only a failed charge invalidates the booking. A failed refund or void concerns a
+    // booking that was already paid for.
+    const chargeFailed =
+      event === 'reject' ||
+      (status === 'FAILURE' && (event === 'pay' || event === 'authorize'));
+
+    const advancesBooking =
+      succeeded &&
+      (event === 'authorize' || event === 'pay') &&
+      booking.status === BookingStatus.PENDING_PAYMENT;
+    const cancelsBooking =
+      chargeFailed && booking.status === BookingStatus.PENDING_PAYMENT;
+    const changesPayment = nextStatus !== null && payment.status !== nextStatus;
+
+    // Idempotency: Kashier retries up to 10 times and replays events, and 409 tells it
+    // to stop. Only treat this as a replay when there is genuinely nothing left to
+    // apply — comparing payment status alone would swallow the very first `authorize`,
+    // because a new online payment already starts out PENDING.
+    if (!changesPayment && !advancesBooking && !cancelsBooking) {
       await this.paymentRepo.save(payment);
       this.logger.log(`Webhook ${event}/${status} for ${merchantOrderId} already applied`);
       res.status(409);
@@ -150,8 +181,6 @@ h2{color:#16a34a;font-size:2rem;margin-bottom:12px}p{color:#555;font-size:1.1rem
     if (nextStatus === PaymentStatus.RELEASED) payment.releasedAt = new Date();
     if (nextStatus === PaymentStatus.REFUNDED) payment.refundedAt = new Date();
     await this.paymentRepo.save(payment);
-
-    const succeeded = status === 'SUCCESS';
 
     if (succeeded && (event === 'authorize' || event === 'pay')) {
       if (booking.status === BookingStatus.PENDING_PAYMENT) {
@@ -168,7 +197,7 @@ h2{color:#16a34a;font-size:2rem;margin-bottom:12px}p{color:#555;font-size:1.1rem
           }));
         }
       }
-    } else if (status === 'FAILURE' || event === 'reject') {
+    } else if (chargeFailed) {
       if (booking.status === BookingStatus.PENDING_PAYMENT) {
         booking.status = BookingStatus.CANCELLED_BY_PASSENGER;
         booking.cancellationReason = 'Payment failed';
@@ -192,7 +221,14 @@ h2{color:#16a34a;font-size:2rem;margin-bottom:12px}p{color:#555;font-size:1.1rem
   // Maps a Kashier event + transaction status onto our payment state.
   // Returns null when the event carries no state change for us.
   private paymentStatusFor(event: string, status: string): PaymentStatus | null {
-    if (status === 'FAILURE' || event === 'reject') return PaymentStatus.FAILED;
+    if (status === 'FAILURE' || event === 'reject') {
+      // Only the charge itself failing makes the payment FAILED. A failed refund, void
+      // or capture leaves the original charge exactly as it was — marking the whole
+      // payment FAILED there would erase a capture that really did succeed.
+      return event === 'pay' || event === 'authorize' || event === 'reject'
+        ? PaymentStatus.FAILED
+        : null;
+    }
     if (status !== 'SUCCESS') return null;
 
     switch (event) {

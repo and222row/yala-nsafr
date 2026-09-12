@@ -32,7 +32,7 @@ export class TripsController {
 
   @Get(':id')
   findOne(@Param('id', ParseUUIDPipe) id: string) {
-    return this.tripsService.findById(id);
+    return this.tripsService.findByIdPublic(id);
   }
 
   @Post()

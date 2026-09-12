@@ -25,6 +25,7 @@ import { TripsService } from '../src/modules/trips/trips.service';
 import { BookingsService } from '../src/modules/bookings/bookings.service';
 import { EarningsService } from '../src/modules/earnings/earnings.service';
 import { KashierService } from '../src/modules/payments/kashier.service';
+import { KashierController } from '../src/modules/payments/kashier.controller';
 import { SosService } from '../src/modules/sos/sos.service';
 import { SosAlert } from '../src/database/entities/sos-alert.entity';
 import { NotificationsService } from '../src/modules/notifications/notifications.service';
@@ -53,6 +54,7 @@ describe('Features E2E', () => {
   let bookingsService: BookingsService;
   let earningsService: EarningsService;
   let kashierService: KashierService;
+  let kashierController: KashierController;
   let sosService: SosService;
   let notificationsService: NotificationsService;
   let ratingsService: RatingsService;
@@ -95,6 +97,7 @@ describe('Features E2E', () => {
     bookingsService = moduleFixture.get(BookingsService);
     earningsService = moduleFixture.get(EarningsService);
     kashierService = moduleFixture.get(KashierService);
+    kashierController = moduleFixture.get(KashierController);
     sosService = moduleFixture.get(SosService);
     notificationsService = moduleFixture.get(NotificationsService);
     ratingsService = moduleFixture.get(RatingsService);
@@ -2461,6 +2464,270 @@ describe('Features E2E', () => {
         notifySpy.mockRestore();
         await cleanup(trip.id, booking.id, payment.id);
       }
+    });
+  });
+
+  // ── 21. Security & payment-integrity regressions ─────────────────────────────
+
+  describe('Payment integrity', () => {
+    async function pendingPaymentBooking() {
+      const trip = await makeTrip({ status: TripStatus.SCHEDULED });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.PENDING_PAYMENT,
+        paymentStatus: PaymentStatus.PENDING,
+      });
+      return { trip, booking, payment };
+    }
+
+    async function cleanup(tripId: string, bookingId: string, paymentId: string) {
+      await paymentRepo.delete(paymentId);
+      await bookingRepo.delete(bookingId);
+      await tripRepo.delete(tripId);
+    }
+
+    // Regression: the idempotency guard compared payment status to the status the event
+    // maps to. A new online payment already starts PENDING and `authorize` maps to
+    // PENDING, so the very first webhook was treated as a replay and the booking never
+    // advanced past pending_payment.
+    it('first authorize webhook advances the booking instead of 409-ing as a replay', async () => {
+      const { trip, booking, payment } = await pendingPaymentBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+      const sigSpy = jest
+        .spyOn(kashierService, 'verifyWebhookSignature')
+        .mockReturnValue(true);
+      const res = { status: jest.fn() } as any;
+
+      await kashierController.transactionWebhook(
+        {
+          event: 'authorize',
+          data: {
+            merchantOrderId: payment.gatewayOrderId,
+            kashierOrderId: 'KSH-ORDER-1',
+            transactionId: 'TX-1',
+            status: 'SUCCESS',
+            signatureKeys: ['status'],
+          },
+        },
+        'sig',
+        res,
+      );
+
+      const updated = await bookingRepo.findOneBy({ id: booking.id });
+      expect(updated?.status).toBe(BookingStatus.PENDING_DRIVER_APPROVAL);
+      expect(res.status).toHaveBeenCalledWith(200);
+
+      notifySpy.mockRestore();
+      sigSpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('a genuine replay of the same event is still rejected with 409', async () => {
+      const { trip, booking, payment } = await pendingPaymentBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+      const sigSpy = jest
+        .spyOn(kashierService, 'verifyWebhookSignature')
+        .mockReturnValue(true);
+      const body = {
+        event: 'authorize',
+        data: {
+          merchantOrderId: payment.gatewayOrderId,
+          status: 'SUCCESS',
+          signatureKeys: ['status'],
+        },
+      };
+
+      const first = { status: jest.fn() } as any;
+      await kashierController.transactionWebhook(body, 'sig', first);
+      const second = { status: jest.fn() } as any;
+      await kashierController.transactionWebhook(body, 'sig', second);
+
+      expect(first.status).toHaveBeenCalledWith(200);
+      expect(second.status).toHaveBeenCalledWith(409);
+
+      notifySpy.mockRestore();
+      sigSpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    // Regression: any FAILURE marked the whole payment FAILED, so a failed refund
+    // erased a capture that had genuinely succeeded.
+    it('a failed refund leaves a captured payment captured', async () => {
+      const trip = await makeTrip({ status: TripStatus.COMPLETED });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.TRIP_COMPLETED,
+        paymentStatus: PaymentStatus.CAPTURED,
+      });
+      const sigSpy = jest
+        .spyOn(kashierService, 'verifyWebhookSignature')
+        .mockReturnValue(true);
+      const res = { status: jest.fn() } as any;
+
+      await kashierController.transactionWebhook(
+        {
+          event: 'refund',
+          data: {
+            merchantOrderId: payment.gatewayOrderId,
+            status: 'FAILURE',
+            signatureKeys: ['status'],
+          },
+        },
+        'sig',
+        res,
+      );
+
+      const updated = await paymentRepo.findOneBy({ id: payment.id });
+      expect(updated?.status).toBe(PaymentStatus.CAPTURED);
+      expect(updated?.status).not.toBe(PaymentStatus.FAILED);
+
+      sigSpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    // Regression: heal accepted any booking id and any order id from any signed-in user
+    it('heal refuses a booking that is not the caller’s', async () => {
+      const { trip, booking, payment } = await pendingPaymentBooking();
+
+      await expect(
+        bookingsService.healFromRedirect(booking.id, 'anything', driverUser),
+      ).rejects.toThrow();
+
+      const untouched = await bookingRepo.findOneBy({ id: booking.id });
+      expect(untouched?.status).toBe(BookingStatus.PENDING_PAYMENT);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('heal refuses to confirm a booking Kashier does not report as paid', async () => {
+      const { trip, booking, payment } = await pendingPaymentBooking();
+      const statusSpy = jest
+        .spyOn(kashierService, 'getPaymentStatus')
+        .mockResolvedValue(null);
+
+      const result = await bookingsService.healFromRedirect(
+        booking.id,
+        'forged-order-id',
+        passengerUser,
+      );
+
+      expect(result.healed).toBe(false);
+      const untouched = await bookingRepo.findOneBy({ id: booking.id });
+      expect(untouched?.status).toBe(BookingStatus.PENDING_PAYMENT);
+
+      statusSpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('heal confirms only when Kashier verifies the payment', async () => {
+      const { trip, booking, payment } = await pendingPaymentBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+      const statusSpy = jest
+        .spyOn(kashierService, 'getPaymentStatus')
+        .mockResolvedValue('AUTHORIZED');
+
+      const result = await bookingsService.healFromRedirect(
+        booking.id,
+        'KSH-REAL',
+        passengerUser,
+      );
+
+      expect(result.healed).toBe(true);
+      const updated = await bookingRepo.findOneBy({ id: booking.id });
+      expect(updated?.status).toBe(BookingStatus.PENDING_DRIVER_APPROVAL);
+
+      statusSpy.mockRestore();
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    // Regression: the detail endpoint returned the whole driver entity
+    it('trip detail omits the driver’s private fields', async () => {
+      const trip = await makeTrip({ status: TripStatus.SCHEDULED });
+      await userRepo.update(driverUser.id, {
+        nationalIdNumber: '29901011234567',
+        fcmToken: 'secret-device-token',
+      });
+
+      const detail: any = await tripsService.findByIdPublic(trip.id);
+
+      expect(detail.driver.fullName).toBeDefined();
+      expect(detail.driver.nationalIdNumber).toBeUndefined();
+      expect(detail.driver.nationalIdPhotoUrl).toBeUndefined();
+      expect(detail.driver.fcmToken).toBeUndefined();
+      expect(detail.driver.emergencyContactPhone).toBeUndefined();
+      expect(JSON.stringify(detail)).not.toContain('secret-device-token');
+
+      await userRepo.update(driverUser.id, {
+        nationalIdNumber: null as any,
+        fcmToken: null as any,
+      });
+      await tripRepo.delete(trip.id);
+    });
+
+    // Regression: cancellation updated the DB to REFUNDED without calling Kashier
+    it('driver cancellation actually voids an authorized hold', async () => {
+      const trip = await makeTrip({ status: TripStatus.SCHEDULED });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.CONFIRMED,
+        paymentStatus: PaymentStatus.PENDING,
+      });
+      const releaseSpy = jest.spyOn(kashierService, 'releasePayment').mockResolvedValue(undefined);
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUsers').mockResolvedValue(undefined as any);
+
+      await tripsService.cancel(trip.id, driverUser, 'test');
+
+      expect(releaseSpy).toHaveBeenCalledTimes(1);
+      const updated = await paymentRepo.findOneBy({ id: payment.id });
+      expect(updated?.status).toBe(PaymentStatus.RELEASED);
+
+      releaseSpy.mockRestore();
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('driver cancellation refunds a captured payment', async () => {
+      const trip = await makeTrip({ status: TripStatus.SCHEDULED });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.CONFIRMED,
+        paymentStatus: PaymentStatus.CAPTURED,
+      });
+      const refundSpy = jest.spyOn(kashierService, 'refundPayment').mockResolvedValue(undefined);
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUsers').mockResolvedValue(undefined as any);
+
+      await tripsService.cancel(trip.id, driverUser, 'test');
+
+      expect(refundSpy).toHaveBeenCalledWith(expect.any(String), 150);
+      const updated = await paymentRepo.findOneBy({ id: payment.id });
+      expect(updated?.status).toBe(PaymentStatus.REFUNDED);
+
+      refundSpy.mockRestore();
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('a gateway failure during cancellation does not record a refund that never happened', async () => {
+      const trip = await makeTrip({ status: TripStatus.SCHEDULED });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.CONFIRMED,
+        paymentStatus: PaymentStatus.CAPTURED,
+      });
+      const refundSpy = jest
+        .spyOn(kashierService, 'refundPayment')
+        .mockRejectedValue(new Error('Kashier API down'));
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUsers').mockResolvedValue(undefined as any);
+
+      // The trip must still cancel — passengers cannot be held on a dead trip
+      await tripsService.cancel(trip.id, driverUser, 'test');
+
+      const updatedTrip = await tripRepo.findOneBy({ id: trip.id });
+      expect(updatedTrip?.status).toBe(TripStatus.CANCELLED);
+      // ...but the payment must not claim to be refunded
+      const updated = await paymentRepo.findOneBy({ id: payment.id });
+      expect(updated?.status).toBe(PaymentStatus.CAPTURED);
+      expect(updated?.refundedAt).toBeNull();
+
+      refundSpy.mockRestore();
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
     });
   });
 

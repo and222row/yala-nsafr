@@ -1,12 +1,13 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource, LessThan, Between, IsNull } from 'typeorm';
+import { Repository, DataSource, LessThan, Between, IsNull, In } from 'typeorm';
 import { Trip, TripStatus } from '../../database/entities/trip.entity';
 import { Booking, BookingStatus } from '../../database/entities/booking.entity';
 import { Payment, PaymentStatus } from '../../database/entities/payment.entity';
 import { User, UserStatus } from '../../database/entities/user.entity';
 import { NotificationsService } from '../notifications/notifications.service';
+import { KashierService } from '../payments/kashier.service';
 
 @Injectable()
 export class SchedulerService {
@@ -17,7 +18,9 @@ export class SchedulerService {
     @InjectRepository(Booking) private readonly bookingRepo: Repository<Booking>,
     @InjectRepository(User) private readonly userRepo: Repository<User>,
     private readonly dataSource: DataSource,
+    @InjectRepository(Payment) private readonly paymentRepo: Repository<Payment>,
     private readonly notifications: NotificationsService,
+    private readonly kashier: KashierService,
   ) {}
 
   // ── Runs every 5 minutes ────────────────────────────────────────────────────
@@ -133,6 +136,7 @@ export class SchedulerService {
 
   private async _autoCancelTrip(trip: Trip) {
     const route = `${trip.originCity} ← ${trip.destinationCity}`;
+    const paymentsToRefund: string[] = [];
 
     await this.dataSource.transaction(async (manager) => {
       const fresh = await manager.findOne(Trip, { where: { id: trip.id } });
@@ -150,17 +154,11 @@ export class SchedulerService {
 
       const passengerIds: string[] = [];
       for (const booking of bookings) {
+        // Collected, not settled here: returning the money needs a Kashier call, which
+        // must not run inside this transaction. Marking the payment REFUNDED without
+        // that call told passengers they had been repaid when nothing had moved.
         if (booking.payment && !booking.payment.isCash) {
-          if (booking.payment.status === PaymentStatus.CAPTURED) {
-            booking.payment.status = PaymentStatus.REFUNDED;
-            booking.payment.refundedAt = new Date();
-            booking.payment.refundAmount = booking.payment.amount;
-            await manager.save(Payment, booking.payment);
-          } else if (booking.payment.status === PaymentStatus.PENDING) {
-            booking.payment.status = PaymentStatus.RELEASED;
-            booking.payment.releasedAt = new Date();
-            await manager.save(Payment, booking.payment);
-          }
+          paymentsToRefund.push(booking.payment.id);
         }
         booking.status = BookingStatus.REFUNDED;
         booking.cancelledAt = new Date();
@@ -236,6 +234,44 @@ export class SchedulerService {
         }),
       );
     });
+
+    await this._returnFunds(paymentsToRefund, `trip ${trip.id} auto-cancelled`);
+  }
+
+  /**
+   * Voids an authorized hold or refunds a captured payment, after the cancelling
+   * transaction has committed. A gateway failure leaves the payment untouched and
+   * logged, so it can be retried — never silently recorded as refunded.
+   */
+  private async _returnFunds(paymentIds: string[], context: string): Promise<void> {
+    if (paymentIds.length === 0) return;
+
+    const payments = await this.paymentRepo.findBy({ id: In(paymentIds) });
+    for (const payment of payments) {
+      if (payment.isCash) continue;
+      const orderId = payment.gatewayTransactionId ?? payment.gatewayOrderId;
+      if (!orderId) continue;
+
+      try {
+        if (payment.status === PaymentStatus.PENDING) {
+          await this.kashier.releasePayment(orderId, payment.kashierTransactionId ?? undefined);
+          payment.status = PaymentStatus.RELEASED;
+          payment.releasedAt = new Date();
+        } else if (payment.status === PaymentStatus.CAPTURED) {
+          await this.kashier.refundPayment(orderId, Number(payment.amount));
+          payment.status = PaymentStatus.REFUNDED;
+          payment.refundAmount = Number(payment.amount);
+          payment.refundedAt = new Date();
+        } else {
+          continue;
+        }
+        await this.paymentRepo.save(payment);
+      } catch (err) {
+        this.logger.error(
+          `Failed to return funds for payment ${payment.id} (${context}, status ${payment.status}): ${err}`,
+        );
+      }
+    }
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
