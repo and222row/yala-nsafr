@@ -18,6 +18,7 @@ class Endpoints {
 
   static const bookings = '/bookings';
   static const myBookings = '/bookings/my';
+  static const cancellationPolicy = '/bookings/cancellation-policy';
   static String bookingById(String id) => '/bookings/$id';
   static String bookingPaymentUrl(String id) => '/bookings/$id/payment-url';
   static String bookingMockConfirm(String id) => '/bookings/$id/mock-confirm';

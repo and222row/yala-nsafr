@@ -15,6 +15,37 @@ final myBookingsProvider = FutureProvider.autoDispose<List<Booking>>((ref) async
   return list.map((e) => Booking.fromJson(e as Map<String, dynamic>)).toList();
 });
 
+// ── Cancellation policy ───────────────────────────────────────────────────────
+// Shown before payment. Read from the server so it always matches what cancellation
+// actually enforces — the thresholds are admin-configurable.
+
+class CancellationPolicy {
+  final double freeCancelHours;
+  final double lateCancelHours;
+  final double lateCancelFeePct;
+
+  const CancellationPolicy({
+    required this.freeCancelHours,
+    required this.lateCancelHours,
+    required this.lateCancelFeePct,
+  });
+
+  int get feePercent => (lateCancelFeePct * 100).round();
+
+  factory CancellationPolicy.fromJson(Map<String, dynamic> j) => CancellationPolicy(
+        freeCancelHours: double.tryParse(j['freeCancelHours']?.toString() ?? '') ?? 48,
+        lateCancelHours: double.tryParse(j['lateCancelHours']?.toString() ?? '') ?? 2,
+        lateCancelFeePct: double.tryParse(j['lateCancelFeePct']?.toString() ?? '') ?? 0.15,
+      );
+}
+
+final cancellationPolicyProvider =
+    FutureProvider.autoDispose<CancellationPolicy>((ref) async {
+  final dio = ref.read(dioProvider);
+  final res = await dio.get(Endpoints.cancellationPolicy);
+  return CancellationPolicy.fromJson(res.data as Map<String, dynamic>);
+});
+
 // ── Single booking ────────────────────────────────────────────────────────────
 
 final bookingDetailProvider =

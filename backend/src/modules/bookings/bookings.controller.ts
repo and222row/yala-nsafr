@@ -34,6 +34,14 @@ export class BookingsController {
     return this.bookingsService.getPassengerBookings(user.id);
   }
 
+  // Must stay above @Get(':id'), which would otherwise match this path first.
+  // The app shows these thresholds before payment, so they have to come from the same
+  // config the cancellation actually enforces rather than being duplicated client-side.
+  @Get('cancellation-policy')
+  cancellationPolicy() {
+    return this.bookingsService.getCancellationPolicy();
+  }
+
   @Get(':id')
   findOne(@Param('id', ParseUUIDPipe) id: string) {
     return this.bookingsService.findById(id);

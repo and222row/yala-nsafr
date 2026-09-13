@@ -48,6 +48,20 @@ export class BookingsService {
     return row ? parseFloat(row.value) : fallback;
   }
 
+  /**
+   * The cancellation thresholds the app must show before payment. Kashier's contract
+   * requires a refund policy the customer can see and accept beforehand, and these are
+   * admin-configurable — so they are read here rather than restated in the client.
+   */
+  async getCancellationPolicy() {
+    const [freeCancelHours, lateCancelHours, lateCancelFeePct] = await Promise.all([
+      this.getConfigNum(CONFIG_KEYS.FREE_CANCEL_HOURS, 48),
+      this.getConfigNum(CONFIG_KEYS.LATE_CANCEL_HOURS, 2),
+      this.getConfigNum(CONFIG_KEYS.LATE_CANCEL_FEE_PCT, 0.15),
+    ]);
+    return { freeCancelHours, lateCancelHours, lateCancelFeePct };
+  }
+
   /** Read-only: calculate what the passenger would get back if they cancel now. */
   async getCancelPreview(bookingId: string, passenger: User) {
     const booking = await this.bookingRepo.findOne({

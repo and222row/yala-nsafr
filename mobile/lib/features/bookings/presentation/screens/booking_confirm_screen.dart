@@ -261,11 +261,18 @@ class _BookingConfirmScreenState extends ConsumerState<BookingConfirmScreen> {
                 Expanded(child: Text(
                   _paymentMethod == 'cash'
                       ? 'سيتم الدفع للسائق نقداً عند الصعود. السائق لديه 30 دقيقة للموافقة على طلبك.'
-                      : 'سيتم الحجز عند إتمام الدفع الإلكتروني. ستُستعاد المبالغ تلقائياً عند الإلغاء.',
+                      : 'سيتم الحجز عند إتمام الدفع الإلكتروني.',
                   style: TextStyle(fontSize: 12, color: Colors.blue.shade700),
                 )),
               ]),
             ),
+            // The passenger has to see what they actually get back before paying —
+            // the previous wording promised an automatic full refund, which is not
+            // the policy the backend applies.
+            if (_paymentMethod != 'cash') ...[
+              const SizedBox(height: 8),
+              const _CancellationPolicyNotice(),
+            ],
             if (error != null) ...[
               const SizedBox(height: 8),
               Text(error, style: const TextStyle(color: Colors.red, fontSize: 13)),
@@ -360,6 +367,86 @@ class _Chip extends StatelessWidget {
             Text(label, style: TextStyle(fontSize: 12, color: color, fontWeight: FontWeight.w600)),
           ],
         ),
+      ),
+    );
+  }
+}
+
+
+/// Shows the actual refund tiers before payment. Kashier's merchant contract requires
+/// a refund policy the customer can see and accept beforehand, and the thresholds are
+/// admin-configurable, so they are read from the server rather than restated here.
+class _CancellationPolicyNotice extends ConsumerWidget {
+  const _CancellationPolicyNotice();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final policy = ref.watch(cancellationPolicyProvider);
+
+    return policy.when(
+      loading: () => const SizedBox.shrink(),
+      error: (_, __) => const SizedBox.shrink(),
+      data: (p) {
+        final free = p.freeCancelHours.toStringAsFixed(0);
+        final late = p.lateCancelHours.toStringAsFixed(0);
+        return Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: Colors.amber.shade50,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: Colors.amber.shade200),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(children: [
+                Icon(Icons.policy_outlined,
+                    size: 18, color: Colors.amber.shade900),
+                const SizedBox(width: 8),
+                Text('سياسة الإلغاء والاسترداد',
+                    style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.amber.shade900)),
+              ]),
+              const SizedBox(height: 8),
+              _PolicyRow(text: 'الإلغاء قبل $free ساعة من الموعد: استرداد كامل المبلغ.'),
+              _PolicyRow(
+                  text:
+                      'الإلغاء بين $late و$free ساعة: استرداد المبلغ بعد خصم ${p.feePercent}% رسوم إلغاء.'),
+              _PolicyRow(
+                  text:
+                      'الإلغاء خلال أقل من $late ساعة أو بعد بدء الرحلة: لا يوجد استرداد.'),
+              const SizedBox(height: 6),
+              Text(
+                'سيظهر لك المبلغ المسترد بالضبط قبل تأكيد الإلغاء.',
+                style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _PolicyRow extends StatelessWidget {
+  final String text;
+  const _PolicyRow({required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('•  ', style: TextStyle(fontSize: 12)),
+          Expanded(
+            child: Text(text, style: const TextStyle(fontSize: 12, height: 1.4)),
+          ),
+        ],
       ),
     );
   }

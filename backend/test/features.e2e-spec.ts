@@ -2639,6 +2639,19 @@ describe('Features E2E', () => {
       await cleanup(trip.id, booking.id, payment.id);
     });
 
+    // Kashier's contract requires the refund policy to be shown before payment. The app
+    // reads it from here so the displayed tiers cannot drift from what is enforced.
+    it('exposes the cancellation policy the backend actually applies', async () => {
+      const policy = await bookingsService.getCancellationPolicy();
+
+      expect(policy.freeCancelHours).toBeGreaterThan(0);
+      expect(policy.lateCancelHours).toBeGreaterThan(0);
+      expect(policy.lateCancelFeePct).toBeGreaterThan(0);
+      expect(policy.lateCancelFeePct).toBeLessThan(1);
+      // The tiers have to be ordered or the displayed policy is nonsense
+      expect(policy.freeCancelHours).toBeGreaterThan(policy.lateCancelHours);
+    });
+
     // Regression: the detail endpoint returned the whole driver entity
     it('trip detail omits the driver’s private fields', async () => {
       const trip = await makeTrip({ status: TripStatus.SCHEDULED });
