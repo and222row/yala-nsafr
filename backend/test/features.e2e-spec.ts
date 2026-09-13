@@ -31,6 +31,7 @@ import { SosAlert } from '../src/database/entities/sos-alert.entity';
 import { NotificationsService } from '../src/modules/notifications/notifications.service';
 import { RatingsService } from '../src/modules/ratings/ratings.service';
 import { Rating, RaterRole } from '../src/database/entities/rating.entity';
+import { PlatformConfig, CONFIG_KEYS } from '../src/database/entities/platform-config.entity';
 import { MessagesService } from '../src/modules/messages/messages.service';
 import { TripMessage } from '../src/database/entities/trip-message.entity';
 import { LocationService } from '../src/modules/location/location.service';
@@ -960,6 +961,44 @@ describe('Features E2E', () => {
       });
     });
 
+    // Regression: balance check and insert were separate statements with no lock, so two
+    // simultaneous requests could both pass and both create a payout.
+    it('two simultaneous withdrawals cannot both succeed', async () => {
+      const { trip, booking, payment } = await seedCompletedEarnings(500); // 450 available
+      const transferSpy = jest
+        .spyOn(kashierService, 'createTransfer')
+        .mockResolvedValue({ transferId: 'TRS-E2E-RACE', isMock: false });
+
+      const attempt = () =>
+        earningsService.requestWithdrawal(
+          driverUser,
+          400,
+          PayoutMethod.VODAFONE_CASH,
+          '01111111111',
+          'Test Driver',
+        );
+
+      // Fired together so both read the balance before either has committed
+      const results = await Promise.allSettled([attempt(), attempt()]);
+      const fulfilled = results.filter((r) => r.status === 'fulfilled');
+      const rejected = results.filter((r) => r.status === 'rejected');
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+
+      // 800 must never have been committed against a 450 balance
+      const created = await withdrawalRepo.find({ where: { driverId: driverUser.id } });
+      expect(created).toHaveLength(1);
+      const summary = await earningsService.getSummary(driverUser.id);
+      expect(summary.pendingBalance).toBeGreaterThanOrEqual(0);
+
+      transferSpy.mockRestore();
+      await withdrawalRepo.delete({ driverId: driverUser.id });
+      await paymentRepo.delete(payment.id);
+      await bookingRepo.delete(booking.id);
+      await tripRepo.delete(trip.id);
+    });
+
     describe('reconcilePendingWithdrawals', () => {
       // Every transfer id used here is prefixed so it can never collide with a real one
       const T = (name: string) => `TRS-E2E-${name}`;
@@ -1227,7 +1266,10 @@ describe('Features E2E', () => {
 
       expect(Number(savedBooking?.totalAmount)).toBeCloseTo(100, 2); // 150 - 50
       expect(Number(savedBooking?.promoDiscountAmount)).toBeCloseTo(50, 2);
-      expect(Number(savedBooking?.driverPayoutAmount)).toBeCloseTo(150 * 0.93, 2); // gross-based
+      // Derived from the booking's own rate rather than a hardcoded one: the point being
+      // asserted is that the driver is paid on the gross fare, not the promo-reduced one.
+      const rate = Number(savedBooking?.commissionRate);
+      expect(Number(savedBooking?.driverPayoutAmount)).toBeCloseTo(150 * (1 - rate), 2);
       expect(Number(updatedUser?.promoBalance)).toBeCloseTo(0, 2);
 
       await paymentRepo.delete({ bookingId: booking.id });
@@ -2637,6 +2679,33 @@ describe('Features E2E', () => {
       statusSpy.mockRestore();
       notifySpy.mockRestore();
       await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    // The admin screen writes commission_rate to platform_config, but create() used to
+    // read only the env var — so a rate changed in the dashboard was silently ignored.
+    it('charges the commission rate held in platform_config, not the env default', async () => {
+      const trip = await makeTrip({ status: TripStatus.SCHEDULED, pricePerSeat: 200 });
+      const configRepo = dataSource.getRepository(PlatformConfig);
+      const original = await configRepo.findOneBy({ key: CONFIG_KEYS.COMMISSION_RATE });
+
+      await configRepo.update({ key: CONFIG_KEYS.COMMISSION_RATE }, { value: '0.10' });
+
+      const booking = await bookingsService.create(passengerUser, {
+        tripId: trip.id,
+        seatsCount: 1,
+        paymentMethod: PaymentMethod.CASH,
+      } as any);
+
+      expect(Number(booking.commissionRate)).toBe(0.1);
+      expect(Number(booking.commissionAmount)).toBe(20);
+      expect(Number(booking.driverPayoutAmount)).toBe(180);
+
+      if (original) {
+        await configRepo.update({ key: CONFIG_KEYS.COMMISSION_RATE }, { value: original.value });
+      }
+      await paymentRepo.delete({ bookingId: booking.id });
+      await bookingRepo.delete(booking.id);
+      await tripRepo.delete(trip.id);
     });
 
     // Kashier's contract requires the refund policy to be shown before payment. The app

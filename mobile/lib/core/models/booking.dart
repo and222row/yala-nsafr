@@ -77,7 +77,7 @@ class Booking {
         totalAmount: double.tryParse(json['totalAmount']?.toString() ?? '') ?? 0.0,
         commissionAmount: double.tryParse(json['commissionAmount']?.toString() ?? '') ?? 0.0,
         driverPayoutAmount: double.tryParse(json['driverPayoutAmount']?.toString() ?? '') ?? 0.0,
-        commissionRate: double.tryParse(json['commissionRate']?.toString() ?? '') ?? 0.07,
+        commissionRate: double.tryParse(json['commissionRate']?.toString() ?? '') ?? 0.10,
         paymentMethod: json['paymentMethod'] as String? ?? 'cash',
         status: json['status'] as String? ?? 'pending_payment',
         confirmedAt: DateTime.tryParse(json['confirmedAt'] as String? ?? ''),

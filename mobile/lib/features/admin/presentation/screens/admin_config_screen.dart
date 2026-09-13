@@ -41,7 +41,7 @@ class _AdminConfigScreenState extends ConsumerState<AdminConfigScreen> {
     if (_initialized) return;
     _initialized = true;
     _commissionCtrl.text =
-        ((double.tryParse(config['commission_rate']?.toString() ?? '0.07') ?? 0.07) * 100)
+        ((double.tryParse(config['commission_rate']?.toString() ?? '0.10') ?? 0.10) * 100)
             .toStringAsFixed(0);
     _autoConfirmCtrl.text = config['auto_confirm_hours']?.toString() ?? '2';
     _disputeWindowCtrl.text =

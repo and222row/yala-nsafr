@@ -45,7 +45,7 @@ export class AdminService implements OnModuleInit {
   // ── Seed default config on first run ──────────────────────────────────────
   async onModuleInit() {
     const defaults: Array<{ key: string; value: string; description: string }> = [
-      { key: CONFIG_KEYS.COMMISSION_RATE, value: '0.07', description: 'Platform commission rate (0–0.5)' },
+      { key: CONFIG_KEYS.COMMISSION_RATE, value: '0.10', description: 'Platform commission rate (0–0.5)' },
       { key: CONFIG_KEYS.AUTO_CONFIRM_HOURS, value: '2', description: 'Hours after departure to auto-confirm trip completion' },
       { key: CONFIG_KEYS.DISPUTE_WINDOW_HOURS, value: '48', description: 'Hours after trip to open a dispute' },
       { key: CONFIG_KEYS.RATING_REVEAL_DAYS, value: '7', description: 'Days before ratings are revealed if partner has not rated' },

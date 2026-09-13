@@ -5,7 +5,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Not, IsNull, MoreThan } from 'typeorm';
+import { Repository, DataSource, Not, IsNull, MoreThan } from 'typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { Booking, BookingStatus, PaymentMethod } from '../../database/entities/booking.entity';
 import { Payment, PaymentStatus } from '../../database/entities/payment.entity';
@@ -34,6 +34,7 @@ export class EarningsService {
     private readonly bookingRepo: Repository<Booking>,
     @InjectRepository(WithdrawalRequest)
     private readonly withdrawalRepo: Repository<WithdrawalRequest>,
+    private readonly dataSource: DataSource,
     private readonly notifications: NotificationsService,
     private readonly kashier: KashierService,
   ) {}
@@ -156,27 +157,41 @@ export class EarningsService {
       throw new BadRequestException(`الحد الأدنى للسحب ${MIN_WITHDRAWAL} جنيه`);
     }
 
-    const summary = await this.getSummary(driver.id);
-    if (amount > summary.pendingBalance) {
-      throw new BadRequestException('المبلغ المطلوب يتجاوز رصيدك المتاح');
-    }
+    // Checking the balance and inserting the request have to be one atomic step. Read
+    // then write with nothing in between let two simultaneous requests both pass the
+    // balance and "no pending withdrawal" checks and both create a payout. Locking the
+    // driver's own row serialises requests per driver without blocking anyone else: the
+    // second waits for the first to commit, then sees the withdrawal it created.
+    const saved = await this.dataSource.transaction(async (manager) => {
+      await manager.findOne(User, {
+        where: { id: driver.id },
+        lock: { mode: 'pessimistic_write' },
+      });
 
-    const pending = await this.withdrawalRepo.count({
-      where: { driverId: driver.id, status: WithdrawalStatus.PENDING },
-    });
-    if (pending > 0) {
-      throw new BadRequestException('لديك طلب سحب قيد المراجعة بالفعل');
-    }
+      const summary = await this.getSummary(driver.id);
+      if (amount > summary.pendingBalance) {
+        throw new BadRequestException('المبلغ المطلوب يتجاوز رصيدك المتاح');
+      }
 
-    const req = this.withdrawalRepo.create({
-      driverId: driver.id,
-      amount,
-      payoutMethod,
-      payoutAccount,
-      payoutName,
-      payoutBank,
+      const pending = await manager.count(WithdrawalRequest, {
+        where: { driverId: driver.id, status: WithdrawalStatus.PENDING },
+      });
+      if (pending > 0) {
+        throw new BadRequestException('لديك طلب سحب قيد المراجعة بالفعل');
+      }
+
+      return manager.save(
+        WithdrawalRequest,
+        manager.create(WithdrawalRequest, {
+          driverId: driver.id,
+          amount,
+          payoutMethod,
+          payoutAccount,
+          payoutName,
+          payoutBank,
+        }),
+      );
     });
-    const saved = await this.withdrawalRepo.save(req);
 
     // Hand the transfer to Kashier. A returned transferId only means Kashier accepted
     // the request — the transfer settles asynchronously and can still end up FAILED, so

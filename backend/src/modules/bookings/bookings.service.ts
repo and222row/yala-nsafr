@@ -165,8 +165,12 @@ export class BookingsService {
         throw new ForbiddenException('This trip is for women passengers only');
       }
 
-      const commissionRate = parseFloat(
-        this.config.get<string>('DEFAULT_COMMISSION_RATE') ?? '0.07',
+      // platform_config is what the admin screen edits, so it has to win. Reading only
+      // the env var meant a rate changed in the dashboard was silently ignored while
+      // bookings kept charging the old one. Env is the fallback for a fresh database.
+      const commissionRate = await this.getConfigNum(
+        CONFIG_KEYS.COMMISSION_RATE,
+        parseFloat(this.config.get<string>('DEFAULT_COMMISSION_RATE') ?? '0.10'),
       );
       const grossAmount = parseFloat(trip.pricePerSeat.toString()) * dto.seatsCount;
 
