@@ -252,7 +252,9 @@ export class EarningsService {
     const watchSince = new Date(Date.now() - RETURN_WATCH_DAYS * 24 * 60 * 60 * 1000);
     const outstanding = await this.withdrawalRepo.find({
       where: [
-        { status: WithdrawalStatus.PENDING, kashierTransferId: Not(IsNull()) },
+        // Deliberately not filtered on kashierTransferId: a create call that timed out
+        // leaves none, and those are exactly the withdrawals most in need of recovery.
+        { status: WithdrawalStatus.PENDING },
         {
           status: WithdrawalStatus.PAID,
           kashierTransferId: Not(IsNull()),
@@ -263,7 +265,24 @@ export class EarningsService {
     if (outstanding.length === 0) return;
 
     for (const withdrawal of outstanding) {
-      const status = await this.kashier.getTransferStatus(withdrawal.kashierTransferId);
+      let status: string | null;
+
+      if (withdrawal.kashierTransferId) {
+        status = await this.kashier.getTransferStatus(withdrawal.kashierTransferId);
+      } else {
+        // No transferId — ask Kashier using the id we sent as merchantTransferId. If it
+        // has one, the create did land despite the timeout and we adopt it; if not, the
+        // request never reached Kashier and the withdrawal stays pending for an admin.
+        const recovered = await this.kashier.getTransferByMerchantId(withdrawal.id);
+        if (!recovered) continue;
+
+        withdrawal.kashierTransferId = recovered.transferId;
+        await this.withdrawalRepo.save(withdrawal);
+        this.logger.log(
+          `Recovered transfer ${recovered.transferId} for withdrawal ${withdrawal.id}`,
+        );
+        status = recovered.status;
+      }
 
       // Anything else (PENDING/INITIATED/IN_TRANSIT, or unreadable) waits for a later run
       if (status !== 'TRANSFERRED' && status !== 'FAILED') continue;

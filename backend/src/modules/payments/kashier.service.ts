@@ -244,6 +244,34 @@ export class KashierService {
   // wraps its payload in `data`, so both are checked.
   // Returns null when the status can't be read — callers must treat that as "unknown",
   // not as failure.
+  /**
+   * Looks a transfer up by the id our own system assigned it. Needed when a create call
+   * times out: Kashier may still have accepted the transfer, but we never received its
+   * transferId, so it can only be found this way.
+   * Returns null when Kashier has no such transfer (404) or cannot be reached.
+   */
+  async getTransferByMerchantId(
+    merchantTransferId: string,
+  ): Promise<{ transferId: string; status: string | null } | null> {
+    if (this.isMock || !merchantTransferId) return null;
+    try {
+      const res = await this.get<Record<string, any>>(
+        `/v2/transfers/merchant-transfer-id/${merchantTransferId}`,
+      );
+      const transferId = res?.['transferId'] ?? res?.['data']?.['transferId'] ?? null;
+      if (!transferId) return null;
+      const raw = res?.['status'] ?? res?.['data']?.['status'] ?? null;
+      return {
+        transferId: String(transferId),
+        status: raw ? String(raw).toUpperCase() : null,
+      };
+    } catch (e) {
+      // A 404 here means the create never reached Kashier, which is a valid answer
+      this.logger.warn(`getTransferByMerchantId(${merchantTransferId}): ${String(e)}`);
+      return null;
+    }
+  }
+
   async getTransferStatus(transferId?: string | null): Promise<string | null> {
     if (this.isMock || !transferId) return null;
     try {

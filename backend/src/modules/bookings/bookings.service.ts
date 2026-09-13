@@ -140,6 +140,8 @@ export class BookingsService {
     let driverId = '';
     let originCity = '';
     let destinationCity = '';
+    // Hoisted so the rollback below can give the credit back if checkout never opens
+    let promoDiscount = 0;
 
     const booking = await this.dataSource.transaction(async (manager) => {
       const trip = await manager.findOne(Trip, {
@@ -174,12 +176,15 @@ export class BookingsService {
       );
       const grossAmount = parseFloat(trip.pricePerSeat.toString()) * dto.seatsCount;
 
-      // Apply promo balance if requested
-      let promoDiscount = 0;
+      // Apply promo balance if requested.
+      // The row is locked for the rest of the transaction: the decrement below is atomic
+      // on its own, but the decision of how much to grant is not. Without the lock two
+      // simultaneous bookings could both read the same balance and both spend it.
       if (dto.usePromo) {
         const freshUser = await manager.findOne(User, {
           where: { id: passenger.id },
           select: { id: true, promoBalance: true },
+          lock: { mode: 'pessimistic_write' },
         });
         const available = Number(freshUser?.promoBalance ?? 0);
         if (available > 0) {
@@ -259,6 +264,19 @@ export class BookingsService {
           .set({ availableSeats: () => `available_seats + ${booking.seatsCount}` })
           .where('id = :id', { id: booking.tripId })
           .execute();
+        // The seats were given back but the promo credit was not, so a passenger whose
+        // checkout failed to open simply lost it.
+        if (promoDiscount > 0) {
+          await this.dataSource.manager.increment(
+            User,
+            { id: passenger.id },
+            'promoBalance',
+            promoDiscount,
+          );
+          this.logger.log(
+            `Restored ${promoDiscount} promo credit to ${passenger.id} after failed checkout`,
+          );
+        }
         throw new BadRequestException('فشل إنشاء جلسة الدفع. يرجى المحاولة مجدداً.');
       }
       // Don't notify driver yet — will notify after payment is authorized (via webhook)

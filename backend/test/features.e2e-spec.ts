@@ -1030,6 +1030,17 @@ describe('Features E2E', () => {
           .mockImplementation(async (id) => (id === transferId ? status : null));
       }
 
+      // The job now looks up withdrawals that have no transferId by merchant id. Stubbed
+      // for every test so none of them reaches the real Kashier API for an unknown id;
+      // the recovery tests override it for their own withdrawal only.
+      let recoverSpy: jest.SpyInstance;
+      beforeEach(() => {
+        recoverSpy = jest
+          .spyOn(kashierService, 'getTransferByMerchantId')
+          .mockResolvedValue(null);
+      });
+      afterEach(() => recoverSpy?.mockRestore());
+
       it('promotes to PAID when Kashier reports the transfer delivered', async () => {
         const w = await pendingWithdrawal(T('DELIVERED'));
         const statusSpy = mockTransferStatus(T('DELIVERED'), 'TRANSFERRED');
@@ -1097,21 +1108,63 @@ describe('Features E2E', () => {
         await withdrawalRepo.delete(w.id);
       });
 
-      it('skips withdrawals that never got a transfer id', async () => {
+      // Regression: a create call that timed out left no transferId, and the job used to
+      // filter those out entirely — so the withdrawal could never be recovered.
+      it('recovers a withdrawal whose create call timed out, by merchant id', async () => {
         const w = await pendingWithdrawal(null);
-        const statusSpy = mockTransferStatus(T('NEVER-SENT'), 'TRANSFERRED');
+        const statusSpy = mockTransferStatus(T('UNUSED'), null);
+        const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+        recoverSpy.mockImplementation(async (id: string) =>
+          id === w.id
+            ? { transferId: T('RECOVERED'), status: 'TRANSFERRED' }
+            : null,
+        );
+
+        await earningsService.reconcilePendingWithdrawals();
+        await waitForBackground();
+
+        const updated = await withdrawalRepo.findOneBy({ id: w.id });
+        // The transfer did land despite the timeout, so it is adopted and settled
+        expect(updated?.kashierTransferId).toBe(T('RECOVERED'));
+        expect(updated?.status).toBe(WithdrawalStatus.PAID);
+
+        statusSpy.mockRestore();
+        notifySpy.mockRestore();
+        await withdrawalRepo.delete(w.id);
+      });
+
+      it('leaves it pending when Kashier has no record of the transfer', async () => {
+        const w = await pendingWithdrawal(null);
+        const statusSpy = mockTransferStatus(T('UNUSED'), null);
+
+        // recoverSpy returns null by default — the create never reached Kashier
+        await earningsService.reconcilePendingWithdrawals();
+
+        const updated = await withdrawalRepo.findOneBy({ id: w.id });
+        expect(updated?.status).toBe(WithdrawalStatus.PENDING);
+        expect(updated?.kashierTransferId).toBeNull();
+
+        statusSpy.mockRestore();
+        await withdrawalRepo.delete(w.id);
+      });
+
+      it('a recovered transfer that failed returns the money to the driver', async () => {
+        const w = await pendingWithdrawal(null);
+        const statusSpy = mockTransferStatus(T('UNUSED'), null);
+        const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+        recoverSpy.mockImplementation(async (id: string) =>
+          id === w.id ? { transferId: T('RECOVERED-FAIL'), status: 'FAILED' } : null,
+        );
 
         await earningsService.reconcilePendingWithdrawals();
 
-        // Excluded by the query's Not(IsNull()) filter, so it is never looked up.
-        // Asserting on this record rather than on the spy, because other outstanding
-        // withdrawals in the database are legitimately queried on the same pass.
-        expect(statusSpy).not.toHaveBeenCalledWith(null);
-        expect(statusSpy).not.toHaveBeenCalledWith(undefined);
         const updated = await withdrawalRepo.findOneBy({ id: w.id });
-        expect(updated?.status).toBe(WithdrawalStatus.PENDING);
+        expect(updated?.status).toBe(WithdrawalStatus.REJECTED);
+        const summary = await earningsService.getSummary(driverUser.id);
+        expect(summary.totalWithdrawn).toBe(0);
 
         statusSpy.mockRestore();
+        notifySpy.mockRestore();
         await withdrawalRepo.delete(w.id);
       });
 
@@ -2506,6 +2559,113 @@ describe('Features E2E', () => {
         notifySpy.mockRestore();
         await cleanup(trip.id, booking.id, payment.id);
       }
+    });
+  });
+
+  // ── 22. Promo credit integrity ───────────────────────────────────────────────
+  // Regression: the balance was read without a lock before being decremented, so two
+  // simultaneous bookings could spend the same credit; and a failed checkout returned
+  // the seats but not the credit.
+
+  describe('Promo credit integrity', () => {
+    afterEach(async () => {
+      await userRepo.update(passengerUser.id, { promoBalance: 0 });
+    });
+
+    it('the same credit cannot be spent twice by simultaneous bookings', async () => {
+      await userRepo.update(passengerUser.id, { promoBalance: 50 });
+      const tripA = await makeTrip({ status: TripStatus.SCHEDULED, pricePerSeat: 100 });
+      const tripB = await makeTrip({ status: TripStatus.SCHEDULED, pricePerSeat: 100 });
+
+      const book = (tripId: string) =>
+        bookingsService.create(passengerUser, {
+          tripId,
+          seatsCount: 1,
+          paymentMethod: PaymentMethod.CASH,
+          usePromo: true,
+        } as any);
+
+      const results = await Promise.allSettled([book(tripA.id), book(tripB.id)]);
+      const bookings = results
+        .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled')
+        .map((r) => r.value);
+
+      const totalDiscount = bookings.reduce(
+        (s, b) => s + Number(b.promoDiscountAmount ?? 0),
+        0,
+      );
+      const user = await userRepo.findOneBy({ id: passengerUser.id });
+
+      // Never grant more than the credit that existed, and never go negative
+      expect(totalDiscount).toBeLessThanOrEqual(50);
+      expect(Number(user?.promoBalance)).toBeGreaterThanOrEqual(0);
+      expect(totalDiscount + Number(user?.promoBalance)).toBeCloseTo(50, 2);
+
+      for (const b of bookings) {
+        await paymentRepo.delete({ bookingId: b.id });
+        await bookingRepo.delete(b.id);
+      }
+      await tripRepo.delete(tripA.id);
+      await tripRepo.delete(tripB.id);
+    });
+
+    it('restores the credit when the payment session cannot be created', async () => {
+      await userRepo.update(passengerUser.id, { promoBalance: 50 });
+      const trip = await makeTrip({ status: TripStatus.SCHEDULED, pricePerSeat: 100 });
+      const sessionSpy = jest
+        .spyOn(kashierService, 'createPaymentSession')
+        .mockRejectedValue(new Error('Kashier API down'));
+
+      await expect(
+        bookingsService.create(passengerUser, {
+          tripId: trip.id,
+          seatsCount: 1,
+          paymentMethod: PaymentMethod.CARD,
+          usePromo: true,
+        } as any),
+      ).rejects.toThrow();
+
+      const user = await userRepo.findOneBy({ id: passengerUser.id });
+      expect(Number(user?.promoBalance)).toBeCloseTo(50, 2);
+
+      // ...and the seat is back too
+      const updatedTrip = await tripRepo.findOneBy({ id: trip.id });
+      expect(updatedTrip?.availableSeats).toBe(trip.availableSeats);
+
+      sessionSpy.mockRestore();
+      const orphan = await bookingRepo.find({ where: { tripId: trip.id } });
+      for (const b of orphan) {
+        await paymentRepo.delete({ bookingId: b.id });
+        await bookingRepo.delete(b.id);
+      }
+      await tripRepo.delete(trip.id);
+    });
+
+    it('does not restore credit when no promo was used', async () => {
+      await userRepo.update(passengerUser.id, { promoBalance: 50 });
+      const trip = await makeTrip({ status: TripStatus.SCHEDULED, pricePerSeat: 100 });
+      const sessionSpy = jest
+        .spyOn(kashierService, 'createPaymentSession')
+        .mockRejectedValue(new Error('Kashier API down'));
+
+      await expect(
+        bookingsService.create(passengerUser, {
+          tripId: trip.id,
+          seatsCount: 1,
+          paymentMethod: PaymentMethod.CARD,
+        } as any),
+      ).rejects.toThrow();
+
+      const user = await userRepo.findOneBy({ id: passengerUser.id });
+      expect(Number(user?.promoBalance)).toBeCloseTo(50, 2);
+
+      sessionSpy.mockRestore();
+      const orphan = await bookingRepo.find({ where: { tripId: trip.id } });
+      for (const b of orphan) {
+        await paymentRepo.delete({ bookingId: b.id });
+        await bookingRepo.delete(b.id);
+      }
+      await tripRepo.delete(trip.id);
     });
   });
 
