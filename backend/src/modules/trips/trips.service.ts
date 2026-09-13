@@ -6,6 +6,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { Repository, DataSource, In } from 'typeorm';
 import { Trip, TripStatus } from '../../database/entities/trip.entity';
 import { User, UserStatus } from '../../database/entities/user.entity';
@@ -368,16 +369,16 @@ export class TripsService {
       });
       completedPassengerIds.push(...confirmedBookings.map((b) => b.passengerId));
 
-      // Mark PENDING (authorized) payments as CAPTURED in DB
+      // Collected only — the payment stays PENDING until Kashier confirms the capture.
+      // Writing CAPTURED here made uncollected money withdrawable during the gateway
+      // call, and a crash in that window left the claim permanent. Recording it after
+      // the fact can only under-credit the driver, which reconciliation repairs.
       for (const booking of confirmedBookings) {
         if (
           booking.payment &&
           !booking.payment.isCash &&
           booking.payment.status === PaymentStatus.PENDING
         ) {
-          booking.payment.status = PaymentStatus.CAPTURED;
-          booking.payment.capturedAt = new Date();
-          await manager.save(Payment, booking.payment);
           paymentsToCaptureIds.push(booking.payment.id);
         }
       }
@@ -401,31 +402,14 @@ export class TripsService {
       return result;
     });
 
-    // After DB transaction: call Kashier capture for each payment (non-blocking)
+    // After the transaction: capture at Kashier, then record it. A payment left PENDING
+    // here is simply not yet collected — reconcileCapturedPayments repairs the case
+    // where the capture succeeded but recording it did not.
     if (paymentsToCaptureIds.length > 0) {
       setImmediate(async () => {
         const payments = await this.paymentRepo.findBy({ id: In(paymentsToCaptureIds) });
         for (const payment of payments) {
-          const orderId = payment.gatewayTransactionId ?? payment.gatewayOrderId;
-          try {
-            await this.kashier.capturePayment(orderId, Number(payment.amount));
-            this.logger.log(`Captured payment ${payment.id} (${payment.amount} EGP)`);
-          } catch (e) {
-            // The transaction already wrote CAPTURED optimistically. Ask Kashier what
-            // actually happened before trusting it — keeping CAPTURED on an uncaptured
-            // order would credit the driver for money we never took.
-            const actual = await this.kashier.getPaymentStatus(payment.gatewaySessionId);
-            if (actual === 'CAPTURED') {
-              this.logger.warn(
-                `Capture call failed for payment ${payment.id} but Kashier reports CAPTURED — keeping CAPTURED: ${String(e)}`,
-              );
-            } else {
-              await this.paymentRepo.update(payment.id, { status: PaymentStatus.PENDING });
-              this.logger.error(
-                `Kashier capture failed for payment ${payment.id} (Kashier status: ${actual ?? 'unknown'}): ${String(e)}`,
-              );
-            }
-          }
+          await this.captureAndRecord(payment);
         }
       });
     }
@@ -444,6 +428,63 @@ export class TripsService {
     }
 
     return saved;
+  }
+
+  /**
+   * Captures a payment at Kashier and only then records it as CAPTURED. If the call
+   * fails, Kashier is asked what actually happened — a capture that really did go
+   * through is still recorded, anything else stays PENDING and is retried later.
+   */
+  private async captureAndRecord(payment: Payment): Promise<void> {
+    if (payment.isCash || payment.status !== PaymentStatus.PENDING) return;
+    const orderId = payment.gatewayTransactionId ?? payment.gatewayOrderId;
+    if (!orderId) return;
+
+    const markCaptured = () =>
+      this.paymentRepo.update(payment.id, {
+        status: PaymentStatus.CAPTURED,
+        capturedAt: new Date(),
+      });
+
+    try {
+      await this.kashier.capturePayment(orderId, Number(payment.amount));
+      await markCaptured();
+      this.logger.log(`Captured payment ${payment.id} (${payment.amount} EGP)`);
+    } catch (e) {
+      const actual = await this.kashier.getPaymentStatus(payment.gatewaySessionId);
+      if (actual === 'CAPTURED') {
+        await markCaptured();
+        this.logger.warn(
+          `Capture call failed for payment ${payment.id} but Kashier reports CAPTURED — recorded: ${String(e)}`,
+        );
+      } else {
+        this.logger.error(
+          `Kashier capture failed for payment ${payment.id} (Kashier status: ${actual ?? 'unknown'}): ${String(e)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Trips finish but their payment can stay PENDING — the capture failed, or it
+   * succeeded and the process died before recording it. Either way the driver is short
+   * until this runs, so retry the capture and let Kashier settle which case it was.
+   */
+  @Cron(CronExpression.EVERY_30_MINUTES)
+  async reconcileCapturedPayments(): Promise<void> {
+    if (this.kashier.isMock) return;
+
+    const stuck = await this.paymentRepo
+      .createQueryBuilder('p')
+      .innerJoin(Booking, 'b', 'b.id = p.booking_id')
+      .where('p.status = :pending', { pending: PaymentStatus.PENDING })
+      .andWhere('p.is_cash = false')
+      .andWhere('b.status = :completed', { completed: BookingStatus.TRIP_COMPLETED })
+      .getMany();
+
+    for (const payment of stuck) {
+      await this.captureAndRecord(payment);
+    }
   }
 
   async getDriverTrips(driverId: string, status?: TripStatus): Promise<Trip[]> {

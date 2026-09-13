@@ -451,7 +451,7 @@ describe('Features E2E', () => {
   // ── 4. Payment capture on markComplete ──────────────────────────────────────
 
   describe('TripsService.markComplete — payment capture', () => {
-    it('DB sets payment to CAPTURED then calls Kashier capture async', async () => {
+    it('records CAPTURED only after Kashier confirms the capture', async () => {
       const trip = await makeTrip({ status: TripStatus.ACTIVE });
       const { booking, payment } = await makeBookingWithPayment(trip.id);
 
@@ -466,7 +466,7 @@ describe('Features E2E', () => {
         tripRepo.findOneBy({ id: trip.id }),
       ]);
 
-      // DB should reflect CAPTURED status
+      // Written after the gateway call succeeded, not before it
       expect(updatedPayment?.status).toBe(PaymentStatus.CAPTURED);
       expect(updatedPayment?.capturedAt).not.toBeNull();
 
@@ -488,7 +488,7 @@ describe('Features E2E', () => {
       await tripRepo.delete(trip.id);
     });
 
-    it('reverts payment to PENDING if capture throws and Kashier does not confirm capture', async () => {
+    it('leaves the payment PENDING if capture throws and Kashier does not confirm it', async () => {
       const trip = await makeTrip({ status: TripStatus.ACTIVE });
       const { booking, payment } = await makeBookingWithPayment(trip.id);
 
@@ -502,8 +502,9 @@ describe('Features E2E', () => {
       await waitForBackground();
 
       const updatedPayment = await paymentRepo.findOneBy({ id: payment.id });
-      // Must revert from CAPTURED → PENDING so a retry can happen later
+      // Never claimed CAPTURED, so nothing to revert — it stays collectable on retry
       expect(updatedPayment?.status).toBe(PaymentStatus.PENDING);
+      expect(updatedPayment?.capturedAt).toBeNull();
 
       captureSpy.mockRestore();
       statusSpy.mockRestore();
@@ -513,7 +514,7 @@ describe('Features E2E', () => {
       await tripRepo.delete(trip.id);
     });
 
-    it('keeps CAPTURED if the capture call fails but Kashier reports the order captured', async () => {
+    it('records CAPTURED when the call fails but Kashier reports the order captured', async () => {
       const trip = await makeTrip({ status: TripStatus.ACTIVE });
       const { booking, payment } = await makeBookingWithPayment(trip.id);
 
@@ -540,7 +541,7 @@ describe('Features E2E', () => {
       await tripRepo.delete(trip.id);
     });
 
-    it('does not silently keep CAPTURED on a 404 when Kashier reports the order uncaptured', async () => {
+    it('does not record CAPTURED on a 404 when Kashier reports the order uncaptured', async () => {
       const trip = await makeTrip({ status: TripStatus.ACTIVE });
       const { booking, payment } = await makeBookingWithPayment(trip.id);
 
@@ -562,6 +563,110 @@ describe('Features E2E', () => {
       captureSpy.mockRestore();
       statusSpy.mockRestore();
 
+      await paymentRepo.delete(payment.id);
+      await bookingRepo.delete(booking.id);
+      await tripRepo.delete(trip.id);
+    });
+
+    // Regression: the transaction wrote CAPTURED before contacting Kashier, so between
+    // commit and the gateway replying the money counted as withdrawable — and a crash in
+    // that window left the claim permanent.
+    it('uncaptured money is not withdrawable while the gateway call is in flight', async () => {
+      const trip = await makeTrip({ status: TripStatus.ACTIVE });
+      const { booking, payment } = await makeBookingWithPayment(trip.id);
+
+      let balanceDuringCapture = -1;
+      const captureSpy = jest
+        .spyOn(kashierService, 'capturePayment')
+        .mockImplementation(async () => {
+          // Sampled at the exact moment the old code had already written CAPTURED
+          const summary = await earningsService.getSummary(driverUser.id);
+          balanceDuringCapture = summary.allTimeOnline;
+        });
+
+      await tripsService.markComplete(trip.id, driverUser);
+      await waitForBackground();
+
+      expect(captureSpy).toHaveBeenCalledTimes(1);
+      expect(balanceDuringCapture).toBe(0);
+
+      // ...and it becomes withdrawable once the capture is recorded
+      const after = await earningsService.getSummary(driverUser.id);
+      expect(after.allTimeOnline).toBe(139.5);
+
+      captureSpy.mockRestore();
+      await paymentRepo.delete(payment.id);
+      await bookingRepo.delete(booking.id);
+      await tripRepo.delete(trip.id);
+    });
+
+    it('reconciliation captures a completed trip whose payment is still pending', async () => {
+      const trip = await makeTrip({ status: TripStatus.COMPLETED });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.TRIP_COMPLETED,
+        paymentStatus: PaymentStatus.PENDING,
+      });
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+
+      await tripsService.reconcileCapturedPayments();
+
+      const updated = await paymentRepo.findOneBy({ id: payment.id });
+      expect(captureSpy).toHaveBeenCalled();
+      expect(updated?.status).toBe(PaymentStatus.CAPTURED);
+      expect(updated?.capturedAt).not.toBeNull();
+
+      captureSpy.mockRestore();
+      await paymentRepo.delete(payment.id);
+      await bookingRepo.delete(booking.id);
+      await tripRepo.delete(trip.id);
+    });
+
+    it('reconciliation records a capture that succeeded but was never written', async () => {
+      const trip = await makeTrip({ status: TripStatus.COMPLETED });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.TRIP_COMPLETED,
+        paymentStatus: PaymentStatus.PENDING,
+      });
+      // The crash case: Kashier already took the money, our write never landed
+      const captureSpy = jest
+        .spyOn(kashierService, 'capturePayment')
+        .mockRejectedValue(new Error('Kashier API error 404'));
+      const statusSpy = jest
+        .spyOn(kashierService, 'getPaymentStatus')
+        .mockResolvedValue('CAPTURED');
+
+      await tripsService.reconcileCapturedPayments();
+
+      const updated = await paymentRepo.findOneBy({ id: payment.id });
+      expect(updated?.status).toBe(PaymentStatus.CAPTURED);
+
+      captureSpy.mockRestore();
+      statusSpy.mockRestore();
+      await paymentRepo.delete(payment.id);
+      await bookingRepo.delete(booking.id);
+      await tripRepo.delete(trip.id);
+    });
+
+    it('reconciliation leaves an uncollected payment alone', async () => {
+      const trip = await makeTrip({ status: TripStatus.COMPLETED });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.TRIP_COMPLETED,
+        paymentStatus: PaymentStatus.PENDING,
+      });
+      const captureSpy = jest
+        .spyOn(kashierService, 'capturePayment')
+        .mockRejectedValue(new Error('Kashier API down'));
+      const statusSpy = jest
+        .spyOn(kashierService, 'getPaymentStatus')
+        .mockResolvedValue('AUTHORIZED');
+
+      await tripsService.reconcileCapturedPayments();
+
+      const updated = await paymentRepo.findOneBy({ id: payment.id });
+      expect(updated?.status).toBe(PaymentStatus.PENDING);
+
+      captureSpy.mockRestore();
+      statusSpy.mockRestore();
       await paymentRepo.delete(payment.id);
       await bookingRepo.delete(booking.id);
       await tripRepo.delete(trip.id);
