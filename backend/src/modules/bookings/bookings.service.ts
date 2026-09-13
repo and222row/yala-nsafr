@@ -24,6 +24,17 @@ import { KashierService } from '../payments/kashier.service';
 // Auto-confirm 2 hours after departure time if no dispute
 const AUTO_CONFIRM_HOURS = 2;
 
+/** What the gateway still has to do once a cancellation has been committed. */
+type CancellationSettlement = {
+  paymentId: string;
+  orderId: string;
+  targetTransactionId?: string;
+  action: 'void' | 'capture' | 'capture_then_refund' | 'refund';
+  captureAmount?: number;
+  refundAmount?: number;
+  fullRefund?: boolean;
+};
+
 @Injectable()
 export class BookingsService {
   private readonly logger = new Logger(BookingsService.name);
@@ -542,7 +553,9 @@ export class BookingsService {
     passenger: User,
     reason?: string,
   ): Promise<Booking & { refundAmount: number; policy: string }> {
-    return this.dataSource.transaction(async (manager) => {
+    let settlement: CancellationSettlement | null = null;
+
+    const result = await this.dataSource.transaction(async (manager) => {
       const booking = await manager.findOne(Booking, {
         where: { id: bookingId },
         relations: { trip: true },
@@ -605,52 +618,46 @@ export class BookingsService {
         .where('id = :id', { id: booking.tripId })
         .execute();
 
-      // Process payment — real Kashier API calls for online payments
+      // Decide what the gateway has to do, but do not call it here. These calls used to
+      // run inside this transaction: a late cancellation captured the fare and then
+      // refunded it, so a failing refund rolled the database back while the capture had
+      // already happened at Kashier — the passenger was charged with no record of it.
       const payment = await manager.findOne(Payment, { where: { bookingId } });
       if (payment && !isCash) {
         const orderId = payment.gatewayTransactionId ?? payment.gatewayOrderId;
+        const targetTransactionId = payment.kashierTransactionId ?? undefined;
 
         if (payment.status === PaymentStatus.PENDING) {
-          // Payment is authorized (held) but not yet captured
           if (policy === 'free_cancel') {
-            // Void the authorization — passenger's held funds are freed. Voiding an
-            // authorize is exempt from Kashier's same-day void window.
-            await this.kashier.releasePayment(orderId, payment.kashierTransactionId ?? undefined);
-            payment.status = PaymentStatus.RELEASED;
-            payment.releasedAt = new Date();
+            // Voiding an authorization is exempt from Kashier's same-day void window
+            settlement = { paymentId: payment.id, orderId, targetTransactionId, action: 'void' };
           } else if (policy === 'late_cancel') {
-            // Capture the full amount first, then refund the passenger's share
-            await this.kashier.capturePayment(orderId, Number(payment.amount));
-            payment.status = PaymentStatus.CAPTURED;
-            payment.capturedAt = new Date();
-            await manager.save(Payment, payment);
-            await this.kashier.refundPayment(orderId, refundAmount);
-            payment.status = PaymentStatus.PARTIALLY_REFUNDED;
-            payment.refundAmount = refundAmount;
-            payment.refundedAt = new Date();
+            settlement = {
+              paymentId: payment.id,
+              orderId,
+              action: 'capture_then_refund',
+              captureAmount: Number(payment.amount),
+              refundAmount,
+            };
           } else {
-            // no_refund: capture the full amount (driver keeps it all)
-            await this.kashier.capturePayment(orderId, Number(payment.amount));
-            payment.status = PaymentStatus.CAPTURED;
-            payment.capturedAt = new Date();
+            // no_refund: capture the full amount, the driver keeps it
+            settlement = {
+              paymentId: payment.id,
+              orderId,
+              action: 'capture',
+              captureAmount: Number(payment.amount),
+            };
           }
-        } else if (payment.status === PaymentStatus.CAPTURED) {
-          // Already captured — issue a refund for the appropriate amount
-          if (refundAmount >= Number(total)) {
-            await this.kashier.refundPayment(orderId, Number(total));
-            payment.status = PaymentStatus.REFUNDED;
-            payment.refundAmount = Number(total);
-            payment.refundedAt = new Date();
-          } else if (refundAmount > 0) {
-            await this.kashier.refundPayment(orderId, refundAmount);
-            payment.status = PaymentStatus.PARTIALLY_REFUNDED;
-            payment.refundAmount = refundAmount;
-            payment.refundedAt = new Date();
-          }
-          // no_refund + already captured: no action needed
+        } else if (payment.status === PaymentStatus.CAPTURED && refundAmount > 0) {
+          settlement = {
+            paymentId: payment.id,
+            orderId,
+            action: 'refund',
+            refundAmount: refundAmount >= Number(total) ? Number(total) : refundAmount,
+            fullRefund: refundAmount >= Number(total),
+          };
         }
-
-        await manager.save(Payment, payment);
+        // no_refund on an already-captured payment needs no gateway call
       }
 
       // Restore promo discount to passenger's balance on free cancellation
@@ -706,6 +713,73 @@ export class BookingsService {
 
       return Object.assign(saved, { refundAmount, policy });
     });
+
+    // Settled after the booking is safely cancelled. A gateway outage must not keep the
+    // passenger on a booking they cancelled, so the money is reconciled separately.
+    await this.settleCancelledPayment(settlement);
+
+    return result;
+  }
+
+  /**
+   * Performs the gateway side of a cancellation. Each step is persisted as soon as it
+   * succeeds, so a capture that goes through followed by a failed refund is recorded as
+   * captured-and-refund-owed rather than being lost — which is what happened when these
+   * calls ran inside the cancelling transaction and a failure rolled the record back.
+   */
+  private async settleCancelledPayment(intent: CancellationSettlement | null): Promise<void> {
+    if (!intent) return;
+
+    try {
+      switch (intent.action) {
+        case 'void':
+          await this.kashier.releasePayment(intent.orderId, intent.targetTransactionId);
+          await this.paymentRepo.update(intent.paymentId, {
+            status: PaymentStatus.RELEASED,
+            releasedAt: new Date(),
+          });
+          break;
+
+        case 'capture':
+          await this.kashier.capturePayment(intent.orderId, intent.captureAmount!);
+          await this.paymentRepo.update(intent.paymentId, {
+            status: PaymentStatus.CAPTURED,
+            capturedAt: new Date(),
+          });
+          break;
+
+        case 'capture_then_refund':
+          await this.kashier.capturePayment(intent.orderId, intent.captureAmount!);
+          // Written before the refund is attempted: if that fails, the record still
+          // shows the money was taken and a refund is outstanding.
+          await this.paymentRepo.update(intent.paymentId, {
+            status: PaymentStatus.CAPTURED,
+            capturedAt: new Date(),
+          });
+          await this.kashier.refundPayment(intent.orderId, intent.refundAmount!);
+          await this.paymentRepo.update(intent.paymentId, {
+            status: PaymentStatus.PARTIALLY_REFUNDED,
+            refundAmount: intent.refundAmount,
+            refundedAt: new Date(),
+          });
+          break;
+
+        case 'refund':
+          await this.kashier.refundPayment(intent.orderId, intent.refundAmount!);
+          await this.paymentRepo.update(intent.paymentId, {
+            status: intent.fullRefund
+              ? PaymentStatus.REFUNDED
+              : PaymentStatus.PARTIALLY_REFUNDED,
+            refundAmount: intent.refundAmount,
+            refundedAt: new Date(),
+          });
+          break;
+      }
+    } catch (err) {
+      this.logger.error(
+        `Failed to settle payment ${intent.paymentId} for cancelled booking (${intent.action}): ${err}`,
+      );
+    }
   }
 
   async getPassengerBookings(passengerId: string): Promise<(Booking & { hasRated: boolean })[]> {

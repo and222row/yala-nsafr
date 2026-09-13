@@ -698,6 +698,16 @@ describe('Features E2E', () => {
   // ── 5. Cancellation policies — Kashier API calls ─────────────────────────────
 
   describe('BookingsService.cancelByPassenger — payment flows', () => {
+    // Cancelling inside 24h of departure adds a strike, and three strikes bar the
+    // passenger from cash bookings. Left to accumulate, these tests eventually break
+    // unrelated ones further down the file.
+    afterEach(async () => {
+      await userRepo.update(passengerUser.id, {
+        cancellationStrikes: 0,
+        cashBookingRestrictedUntil: null as any,
+      });
+    });
+
     it('free_cancel: releases PENDING payment (>48h before departure)', async () => {
       const trip = await makeTrip({
         departureTime: new Date(Date.now() + 60 * 3_600_000), // 60h from now
@@ -818,6 +828,88 @@ describe('Features E2E', () => {
       refundSpy.mockRestore();
       releaseSpy.mockRestore();
 
+      await paymentRepo.delete(payment.id);
+      await bookingRepo.delete(booking.id);
+      await tripRepo.delete(trip.id);
+    });
+
+    // Regression: capture and refund both ran inside the cancelling transaction, so a
+    // refund failure rolled the database back while the capture had already happened at
+    // Kashier — the passenger was charged with nothing recording it.
+    it('a capture that succeeds is recorded even when the refund then fails', async () => {
+      const trip = await makeTrip({
+        departureTime: new Date(Date.now() + 5 * 3_600_000), // late-cancel window
+      });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.CONFIRMED,
+        paymentStatus: PaymentStatus.PENDING,
+      });
+
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+      const refundSpy = jest
+        .spyOn(kashierService, 'refundPayment')
+        .mockRejectedValue(new Error('Kashier API down'));
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+
+      const fresh = await bookingRepo.findOne({
+        where: { id: booking.id },
+        relations: { trip: true },
+      });
+      await bookingsService.cancelByPassenger(fresh!.id, passengerUser);
+
+      expect(captureSpy).toHaveBeenCalledTimes(1);
+      expect(refundSpy).toHaveBeenCalledTimes(1);
+
+      // The money really was taken, so the record has to say so — a rollback here would
+      // leave a charged passenger with no trace of it.
+      const updatedPayment = await paymentRepo.findOneBy({ id: payment.id });
+      expect(updatedPayment?.status).toBe(PaymentStatus.CAPTURED);
+      expect(updatedPayment?.capturedAt).not.toBeNull();
+      expect(updatedPayment?.refundedAt).toBeNull();
+
+      // And the cancellation itself still stands — a gateway outage must not trap the
+      // passenger on a booking they cancelled
+      const updatedBooking = await bookingRepo.findOneBy({ id: booking.id });
+      expect(updatedBooking?.cancelledAt).not.toBeNull();
+
+      captureSpy.mockRestore();
+      refundSpy.mockRestore();
+      notifySpy.mockRestore();
+      await paymentRepo.delete(payment.id);
+      await bookingRepo.delete(booking.id);
+      await tripRepo.delete(trip.id);
+    });
+
+    it('a failed void leaves the hold recorded as still held', async () => {
+      const trip = await makeTrip({
+        departureTime: new Date(Date.now() + 72 * 3_600_000), // free-cancel window
+      });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.CONFIRMED,
+        paymentStatus: PaymentStatus.PENDING,
+      });
+
+      const releaseSpy = jest
+        .spyOn(kashierService, 'releasePayment')
+        .mockRejectedValue(new Error('Kashier API down'));
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+
+      const fresh = await bookingRepo.findOne({
+        where: { id: booking.id },
+        relations: { trip: true },
+      });
+      await bookingsService.cancelByPassenger(fresh!.id, passengerUser);
+
+      // Not marked RELEASED — the hold is still in place and the void must be retried
+      const updatedPayment = await paymentRepo.findOneBy({ id: payment.id });
+      expect(updatedPayment?.status).toBe(PaymentStatus.PENDING);
+      expect(updatedPayment?.releasedAt).toBeNull();
+
+      const updatedBooking = await bookingRepo.findOneBy({ id: booking.id });
+      expect(updatedBooking?.cancelledAt).not.toBeNull();
+
+      releaseSpy.mockRestore();
+      notifySpy.mockRestore();
       await paymentRepo.delete(payment.id);
       await bookingRepo.delete(booking.id);
       await tripRepo.delete(trip.id);
