@@ -40,6 +40,15 @@ class TokenStorage {
   }
 }
 
+/// Plain Dio used only for the token refresh call, so it never re-enters the
+/// interceptor below. Separate provider so tests can drive the refresh response.
+final refreshDioProvider = Provider<Dio>((ref) {
+  return Dio(BaseOptions(
+    baseUrl: _baseUrl,
+    headers: {'Content-Type': 'application/json'},
+  ));
+});
+
 final dioProvider = Provider<Dio>((ref) {
   final tokenStorage = ref.read(tokenStorageProvider);
 
@@ -90,39 +99,54 @@ final dioProvider = Provider<Dio>((ref) {
         // Acquire the refresh lock before the first await
         isRefreshing = true;
         refreshCompleter = Completer<void>();
+        // completeError below has no listener when nothing is queued behind the
+        // refresh, which would surface as an unhandled async error. Real waiters
+        // still receive the error; this only stops it going nowhere.
+        unawaited(refreshCompleter!.future.catchError((_) {}));
 
+        // Only the refresh itself is guarded here. Replaying the original request used
+        // to sit inside this try, so a failed replay ran the refresh-failure handler:
+        // it called completeError on an already-completed completer, which threw a
+        // StateError that skipped releasing the lock and calling the handler — leaving
+        // isRefreshing stuck true forever and the caller's future never settled. It also
+        // deleted tokens that had just been minted successfully.
+        final String newAccess;
         try {
           final rawRefreshToken = await tokenStorage.readRefreshToken();
           if (rawRefreshToken == null) throw Exception('No refresh token stored');
 
-          // Use a plain Dio instance to avoid going through this interceptor again
-          final refreshDio = Dio(BaseOptions(
-            baseUrl: _baseUrl,
-            headers: {'Content-Type': 'application/json'},
-          ));
+          // A plain Dio instance, so this does not go through the interceptor again
+          final refreshDio = ref.read(refreshDioProvider);
           final res = await refreshDio.post(
             '/auth/refresh',
             data: {'refreshToken': rawRefreshToken},
           );
 
-          final newAccess = res.data['accessToken'] as String;
+          newAccess = res.data['accessToken'] as String;
           final newRefresh = res.data['refreshToken'] as String;
           await tokenStorage.save(newAccess);
           await tokenStorage.saveRefreshToken(newRefresh);
-
-          refreshCompleter!.complete();
-          isRefreshing = false;
-
-          // Replay the original request with the new token
-          error.requestOptions.headers['Authorization'] = 'Bearer $newAccess';
-          final retryResponse = await dio.fetch(error.requestOptions);
-          return handler.resolve(retryResponse);
         } catch (e) {
+          // The refresh genuinely failed, so the session is gone
           await tokenStorage.deleteAll();
-          refreshCompleter!.completeError(e);
+          if (!refreshCompleter!.isCompleted) refreshCompleter!.completeError(e);
           isRefreshing = false;
           // Signal the auth notifier to transition to unauthenticated
           ref.read(forceLogoutCounterProvider.notifier).state++;
+          return handler.next(error);
+        }
+
+        // Release the lock and wake queued requests before replaying, so a slow or
+        // failing replay cannot hold up every other request waiting on the refresh.
+        if (!refreshCompleter!.isCompleted) refreshCompleter!.complete();
+        isRefreshing = false;
+
+        try {
+          error.requestOptions.headers['Authorization'] = 'Bearer $newAccess';
+          final retryResponse = await dio.fetch(error.requestOptions);
+          return handler.resolve(retryResponse);
+        } catch (_) {
+          // The session is still valid — surface the failure without logging out
           return handler.next(error);
         }
       },
