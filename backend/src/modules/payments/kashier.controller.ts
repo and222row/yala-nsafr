@@ -119,27 +119,31 @@ h2{color:#16a34a;font-size:2rem;margin-bottom:12px}p{color:#555;font-size:1.1rem
       return;
     }
 
-    // Logged at error level with the computed payload: a silent drop here is what made
-    // the previous signature bug invisible.
+    // Deliberately NOT a 200. Kashier treats 200 and 409 as acknowledgement and stops
+    // retrying, so acking an event we could not verify would discard it permanently —
+    // and a misconfigured key would silently destroy every webhook instead of failing
+    // visibly. A 401 costs at most 10 bounded retries and shows up in Kashier's
+    // delivery records.
     if (!this.kashierService.verifyWebhookSignature(data, signature)) {
       this.logger.error(
         `Invalid webhook signature for order ${merchantOrderId}. ` +
           `header=${signature ?? '(none)'} payload=${this.kashierService.buildWebhookSignaturePayload(data) ?? '(no signatureKeys)'}`,
       );
-      res.status(200);
+      res.status(401);
       return;
     }
 
+    // Also retryable: the webhook can legitimately arrive before our own commit lands
     const payment = await this.paymentRepo.findOne({ where: { gatewayOrderId: merchantOrderId } });
     if (!payment) {
       this.logger.warn(`No payment found for merchantOrderId ${merchantOrderId}`);
-      res.status(200);
+      res.status(404);
       return;
     }
 
     const booking = await this.bookingRepo.findOne({ where: { id: payment.bookingId } });
     if (!booking) {
-      res.status(200);
+      res.status(404);
       return;
     }
 
@@ -245,10 +249,10 @@ h2{color:#16a34a;font-size:2rem;margin-bottom:12px}p{color:#555;font-size:1.1rem
 
   // Called by Kashier when a transfer (driver payout) status changes
   @Post('webhooks/transfer')
-  @HttpCode(200)
   async transferWebhook(
     @Body() body: Record<string, unknown>,
     @Headers('x-kashier-signature') signature: string | undefined,
+    @Res({ passthrough: true }) res: Response,
   ) {
     this.logger.log(`Kashier transfer webhook: ${JSON.stringify(body)}`);
 
@@ -257,22 +261,35 @@ h2{color:#16a34a;font-size:2rem;margin-bottom:12px}p{color:#555;font-size:1.1rem
     const status = String(body['status'] ?? '').toUpperCase();
     const openForReturn = Boolean(body['openForReturn']);
 
-    if (!merchantTransferId) return { received: true };
+    // Nothing a retry could fix on a malformed body, so this one is acknowledged
+    if (!merchantTransferId) {
+      res.status(200);
+      return { received: true };
+    }
 
     // Unverified, this endpoint would let anyone mark a withdrawal PAID or FAILED.
     // Note this uses the payout verifier, not the payment one — Kashier signs the two
     // differently and a shared verifier silently rejects every payout webhook.
+    //
+    // Answered with 401, not 200: Kashier stops retrying on 200/409, so acknowledging
+    // an event we could not verify would destroy it. That matters most while
+    // KASHIER_TRANSFER_API_KEY is unset, when verification cannot succeed at all.
     if (!this.kashierService.verifyTransferWebhookSignature(body, signature)) {
       this.logger.error(
         `Invalid payout webhook signature for ${merchantTransferId}. ` +
           `header=${signature ?? '(none)'} ` +
           `payload=${this.kashierService.buildTransferSignaturePayload(body) ?? '(no signatureKeys)'}`,
       );
-      return { received: true };
+      res.status(401);
+      return { received: false };
     }
 
     const withdrawal = await this.withdrawalRepo.findOne({ where: { id: merchantTransferId } });
-    if (!withdrawal) return { received: true };
+    if (!withdrawal) {
+      // Retryable: the initiation webhook can outrun our own commit
+      res.status(404);
+      return { received: false };
+    }
 
     if (transferId) withdrawal.kashierTransferId = transferId;
 

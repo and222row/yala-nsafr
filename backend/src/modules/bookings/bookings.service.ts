@@ -748,24 +748,39 @@ export class BookingsService {
           });
           break;
 
-        case 'capture_then_refund':
-          await this.kashier.capturePayment(intent.orderId, intent.captureAmount!);
+        case 'capture_then_refund': {
+          const { transactionId } = await this.kashier.capturePayment(
+            intent.orderId,
+            intent.captureAmount!,
+          );
           // Written before the refund is attempted: if that fails, the record still
           // shows the money was taken and a refund is outstanding.
           await this.paymentRepo.update(intent.paymentId, {
             status: PaymentStatus.CAPTURED,
             capturedAt: new Date(),
+            ...(transactionId ? { kashierTransactionId: transactionId } : {}),
           });
-          await this.kashier.refundPayment(intent.orderId, intent.refundAmount!);
+          // Refund the capture we just made, rather than letting Kashier pick a
+          // transaction on the order
+          await this.kashier.refundPayment(
+            intent.orderId,
+            intent.refundAmount!,
+            transactionId ?? undefined,
+          );
           await this.paymentRepo.update(intent.paymentId, {
             status: PaymentStatus.PARTIALLY_REFUNDED,
             refundAmount: intent.refundAmount,
             refundedAt: new Date(),
           });
           break;
+        }
 
         case 'refund':
-          await this.kashier.refundPayment(intent.orderId, intent.refundAmount!);
+          await this.kashier.refundPayment(
+            intent.orderId,
+            intent.refundAmount!,
+            intent.targetTransactionId,
+          );
           await this.paymentRepo.update(intent.paymentId, {
             status: intent.fullRefund
               ? PaymentStatus.REFUNDED

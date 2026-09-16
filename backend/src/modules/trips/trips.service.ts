@@ -440,18 +440,28 @@ export class TripsService {
     const orderId = payment.gatewayTransactionId ?? payment.gatewayOrderId;
     if (!orderId) return;
 
-    const markCaptured = () =>
+    const markCaptured = (transactionId?: string | null) =>
       this.paymentRepo.update(payment.id, {
         status: PaymentStatus.CAPTURED,
         capturedAt: new Date(),
+        // Kashier returns the capture's own TX id, which a later void or refund needs
+        // as targetTransactionId. Nothing else we hold can substitute for it.
+        ...(transactionId ? { kashierTransactionId: transactionId } : {}),
       });
 
     try {
-      await this.kashier.capturePayment(orderId, Number(payment.amount));
-      await markCaptured();
+      const { transactionId } = await this.kashier.capturePayment(
+        orderId,
+        Number(payment.amount),
+      );
+      await markCaptured(transactionId);
       this.logger.log(`Captured payment ${payment.id} (${payment.amount} EGP)`);
     } catch (e) {
-      const actual = await this.kashier.getPaymentStatus(payment.gatewaySessionId);
+      // Asked by merchantOrderId, which we always have — the session lookup depends on
+      // a sessionId parsed from the checkout URL and is null on older payments.
+      const actual =
+        (await this.kashier.getOrderStatus(payment.gatewayOrderId)) ??
+        (await this.kashier.getPaymentStatus(payment.gatewaySessionId));
       if (actual === 'CAPTURED') {
         await markCaptured();
         this.logger.warn(

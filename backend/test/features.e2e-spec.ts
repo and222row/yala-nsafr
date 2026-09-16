@@ -75,11 +75,13 @@ describe('Features E2E', () => {
   let driverUser: User;
   let passengerUser: User;
 
-  // Clear all mock state before each test to prevent spy call-count bleed-over.
-  // Tests that use spies must still call mockRestore() in their own cleanup
-  // (or a finally block) so the real method is in place for subsequent tests.
+  // clearAllMocks only resets call counts — a mockResolvedValue set by one test stayed
+  // in place for every later test, so a spy whose mockRestore was skipped (or whose
+  // test failed before reaching it) silently changed unrelated results. restoreAllMocks
+  // puts the real implementations back, and each test installs its own spies afterwards
+  // because inner beforeEach hooks run after this one.
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.restoreAllMocks();
   });
 
   // ── Setup ────────────────────────────────────────────────────────────────────
@@ -455,7 +457,7 @@ describe('Features E2E', () => {
       const trip = await makeTrip({ status: TripStatus.ACTIVE });
       const { booking, payment } = await makeBookingWithPayment(trip.id);
 
-      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue({ transactionId: null });
 
       await tripsService.markComplete(trip.id, driverUser);
       await waitForBackground();
@@ -496,6 +498,7 @@ describe('Features E2E', () => {
         .spyOn(kashierService, 'capturePayment')
         .mockRejectedValue(new Error('Kashier API down'));
       // Kashier can't confirm a capture → our optimistic CAPTURED write must be undone
+      const orderStatusSpy = jest.spyOn(kashierService, 'getOrderStatus').mockResolvedValue(null);
       const statusSpy = jest.spyOn(kashierService, 'getPaymentStatus').mockResolvedValue(null);
 
       await tripsService.markComplete(trip.id, driverUser);
@@ -522,6 +525,7 @@ describe('Features E2E', () => {
       const captureSpy = jest
         .spyOn(kashierService, 'capturePayment')
         .mockRejectedValue(new Error('Kashier API error 404: Cannot PUT /v3/orders/x'));
+      const orderStatusSpy_statusSpy = jest.spyOn(kashierService, 'getOrderStatus').mockResolvedValue(null);
       const statusSpy = jest
         .spyOn(kashierService, 'getPaymentStatus')
         .mockResolvedValue('CAPTURED');
@@ -550,6 +554,7 @@ describe('Features E2E', () => {
       const captureSpy = jest
         .spyOn(kashierService, 'capturePayment')
         .mockRejectedValue(new Error('Kashier API error 404: Cannot PUT /v3/orders/x'));
+      const orderStatusSpy_statusSpy = jest.spyOn(kashierService, 'getOrderStatus').mockResolvedValue(null);
       const statusSpy = jest
         .spyOn(kashierService, 'getPaymentStatus')
         .mockResolvedValue('AUTHORIZED');
@@ -582,6 +587,7 @@ describe('Features E2E', () => {
           // Sampled at the exact moment the old code had already written CAPTURED
           const summary = await earningsService.getSummary(driverUser.id);
           balanceDuringCapture = summary.allTimeOnline;
+          return { transactionId: null };
         });
 
       await tripsService.markComplete(trip.id, driverUser);
@@ -606,7 +612,7 @@ describe('Features E2E', () => {
         bookingStatus: BookingStatus.TRIP_COMPLETED,
         paymentStatus: PaymentStatus.PENDING,
       });
-      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue({ transactionId: null });
 
       await tripsService.reconcileCapturedPayments();
 
@@ -631,6 +637,7 @@ describe('Features E2E', () => {
       const captureSpy = jest
         .spyOn(kashierService, 'capturePayment')
         .mockRejectedValue(new Error('Kashier API error 404'));
+      const orderStatusSpy_statusSpy = jest.spyOn(kashierService, 'getOrderStatus').mockResolvedValue(null);
       const statusSpy = jest
         .spyOn(kashierService, 'getPaymentStatus')
         .mockResolvedValue('CAPTURED');
@@ -656,6 +663,7 @@ describe('Features E2E', () => {
       const captureSpy = jest
         .spyOn(kashierService, 'capturePayment')
         .mockRejectedValue(new Error('Kashier API down'));
+      const orderStatusSpy_statusSpy = jest.spyOn(kashierService, 'getOrderStatus').mockResolvedValue(null);
       const statusSpy = jest
         .spyOn(kashierService, 'getPaymentStatus')
         .mockResolvedValue('AUTHORIZED');
@@ -679,7 +687,7 @@ describe('Features E2E', () => {
         paymentStatus: PaymentStatus.PENDING,
       });
 
-      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue({ transactionId: null });
 
       await tripsService.markComplete(trip.id, driverUser);
       await waitForBackground();
@@ -717,7 +725,7 @@ describe('Features E2E', () => {
       });
 
       const releaseSpy = jest.spyOn(kashierService, 'releasePayment').mockResolvedValue(undefined);
-      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue({ transactionId: null });
 
       const result = await bookingsService.cancelByPassenger(booking.id, passengerUser);
 
@@ -745,7 +753,7 @@ describe('Features E2E', () => {
         paymentStatus: PaymentStatus.PENDING,
       });
 
-      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue({ transactionId: null });
       const refundSpy = jest.spyOn(kashierService, 'refundPayment').mockResolvedValue(undefined);
       const releaseSpy = jest.spyOn(kashierService, 'releasePayment').mockResolvedValue(undefined);
 
@@ -756,7 +764,8 @@ describe('Features E2E', () => {
       expect(captureSpy).toHaveBeenCalledTimes(1);
       // Then: refund (total - 15% fee) = 150 * 0.85 = 127.50
       expect(refundSpy).toHaveBeenCalledTimes(1);
-      expect(refundSpy).toHaveBeenCalledWith(expect.any(String), 127.5);
+      expect(refundSpy.mock.calls[0][0]).toEqual(expect.any(String));
+      expect(refundSpy.mock.calls[0][1]).toBe(127.5);
       expect(releaseSpy).not.toHaveBeenCalled();
 
       const updatedPayment = await paymentRepo.findOneBy({ id: payment.id });
@@ -781,7 +790,7 @@ describe('Features E2E', () => {
         paymentStatus: PaymentStatus.PENDING,
       });
 
-      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue({ transactionId: null });
       const refundSpy = jest.spyOn(kashierService, 'refundPayment').mockResolvedValue(undefined);
       const releaseSpy = jest.spyOn(kashierService, 'releasePayment').mockResolvedValue(undefined);
 
@@ -819,7 +828,8 @@ describe('Features E2E', () => {
 
       expect(result.policy).toBe('free_cancel');
       expect(refundSpy).toHaveBeenCalledTimes(1);
-      expect(refundSpy).toHaveBeenCalledWith(expect.any(String), 150);
+      expect(refundSpy.mock.calls[0][0]).toEqual(expect.any(String));
+      expect(refundSpy.mock.calls[0][1]).toBe(150);
       expect(releaseSpy).not.toHaveBeenCalled();
 
       const updatedPayment = await paymentRepo.findOneBy({ id: payment.id });
@@ -845,7 +855,7 @@ describe('Features E2E', () => {
         paymentStatus: PaymentStatus.PENDING,
       });
 
-      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue({ transactionId: null });
       const refundSpy = jest
         .spyOn(kashierService, 'refundPayment')
         .mockRejectedValue(new Error('Kashier API down'));
@@ -926,7 +936,7 @@ describe('Features E2E', () => {
       });
 
       const releaseSpy = jest.spyOn(kashierService, 'releasePayment').mockResolvedValue(undefined);
-      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue({ transactionId: null });
       const refundSpy = jest.spyOn(kashierService, 'refundPayment').mockResolvedValue(undefined);
 
       await bookingsService.cancelByPassenger(booking.id, passengerUser);
@@ -1634,7 +1644,7 @@ describe('Features E2E', () => {
       await bookingRepo.update(booking.id, { promoDiscountAmount: 30 });
       await setPromoBalance(passengerUser.id, 0);
 
-      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue({ transactionId: null });
       const refundSpy = jest.spyOn(kashierService, 'refundPayment').mockResolvedValue(undefined);
 
       const result = await bookingsService.cancelByPassenger(booking.id, passengerUser);
@@ -1905,7 +1915,7 @@ describe('Features E2E', () => {
         }),
       );
 
-      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue(undefined);
+      const captureSpy = jest.spyOn(kashierService, 'capturePayment').mockResolvedValue({ transactionId: null });
 
       await tripsService.markComplete(trip.id, driverUser);
       await waitForBackground();
@@ -2659,7 +2669,8 @@ describe('Features E2E', () => {
       await bookingsService.rejectBooking(booking.id, driverUser);
 
       expect(refundSpy).toHaveBeenCalledTimes(1);
-      expect(refundSpy).toHaveBeenCalledWith(expect.any(String), 150);
+      expect(refundSpy.mock.calls[0][0]).toEqual(expect.any(String));
+      expect(refundSpy.mock.calls[0][1]).toBe(150);
       expect(releaseSpy).not.toHaveBeenCalled();
 
       const updated = await paymentRepo.findOneBy({ id: payment.id });
@@ -2948,6 +2959,85 @@ describe('Features E2E', () => {
       await cleanup(trip.id, booking.id, payment.id);
     });
 
+    // Kashier treats 200 and 409 as acknowledgement and stops retrying, so an event we
+    // could not verify must not be answered with either — otherwise a misconfigured key
+    // silently destroys every webhook instead of failing visibly.
+    it('does not acknowledge a webhook whose signature fails to verify', async () => {
+      const { trip, booking, payment } = await pendingPaymentBooking();
+      const sigSpy = jest
+        .spyOn(kashierService, 'verifyWebhookSignature')
+        .mockReturnValue(false);
+      const res = { status: jest.fn() } as any;
+
+      await kashierController.transactionWebhook(
+        {
+          event: 'authorize',
+          data: {
+            merchantOrderId: payment.gatewayOrderId,
+            status: 'SUCCESS',
+            signatureKeys: ['status'],
+          },
+        },
+        'bad-signature',
+        res,
+      );
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(res.status).not.toHaveBeenCalledWith(200);
+      expect(res.status).not.toHaveBeenCalledWith(409);
+
+      // ...and nothing was applied
+      const untouched = await bookingRepo.findOneBy({ id: booking.id });
+      expect(untouched?.status).toBe(BookingStatus.PENDING_PAYMENT);
+
+      sigSpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('does not acknowledge a webhook for a payment it cannot find', async () => {
+      const sigSpy = jest
+        .spyOn(kashierService, 'verifyWebhookSignature')
+        .mockReturnValue(true);
+      const res = { status: jest.fn() } as any;
+
+      await kashierController.transactionWebhook(
+        {
+          event: 'authorize',
+          data: {
+            merchantOrderId: 'no-such-order',
+            status: 'SUCCESS',
+            signatureKeys: ['status'],
+          },
+        },
+        'sig',
+        res,
+      );
+
+      // Retryable on purpose — the webhook can arrive before our own commit lands
+      expect(res.status).toHaveBeenCalledWith(404);
+      expect(res.status).not.toHaveBeenCalledWith(200);
+
+      sigSpy.mockRestore();
+    });
+
+    it('does not acknowledge an unverified payout webhook', async () => {
+      const sigSpy = jest
+        .spyOn(kashierService, 'verifyTransferWebhookSignature')
+        .mockReturnValue(false);
+      const res = { status: jest.fn() } as any;
+
+      const result = await kashierController.transferWebhook(
+        { merchantTransferId: 'some-id', status: 'TRANSFERRED', signatureKeys: ['status'] },
+        'bad-signature',
+        res,
+      );
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(result).toEqual({ received: false });
+
+      sigSpy.mockRestore();
+    });
+
     // Regression: any FAILURE marked the whole payment FAILED, so a failed refund
     // erased a capture that had genuinely succeeded.
     it('a failed refund leaves a captured payment captured', async () => {
@@ -2998,6 +3088,7 @@ describe('Features E2E', () => {
 
     it('heal refuses to confirm a booking Kashier does not report as paid', async () => {
       const { trip, booking, payment } = await pendingPaymentBooking();
+      const orderStatusSpy_statusSpy = jest.spyOn(kashierService, 'getOrderStatus').mockResolvedValue(null);
       const statusSpy = jest
         .spyOn(kashierService, 'getPaymentStatus')
         .mockResolvedValue(null);
@@ -3019,6 +3110,7 @@ describe('Features E2E', () => {
     it('heal confirms only when Kashier verifies the payment', async () => {
       const { trip, booking, payment } = await pendingPaymentBooking();
       const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+      const orderStatusSpy_statusSpy = jest.spyOn(kashierService, 'getOrderStatus').mockResolvedValue(null);
       const statusSpy = jest
         .spyOn(kashierService, 'getPaymentStatus')
         .mockResolvedValue('AUTHORIZED');
@@ -3134,7 +3226,8 @@ describe('Features E2E', () => {
 
       await tripsService.cancel(trip.id, driverUser, 'test');
 
-      expect(refundSpy).toHaveBeenCalledWith(expect.any(String), 150);
+      expect(refundSpy.mock.calls[0][0]).toEqual(expect.any(String));
+      expect(refundSpy.mock.calls[0][1]).toBe(150);
       const updated = await paymentRepo.findOneBy({ id: payment.id });
       expect(updated?.status).toBe(PaymentStatus.REFUNDED);
 
@@ -3377,6 +3470,92 @@ describe('Features E2E', () => {
       expect(calls[0].method).toBe('POST');
       expect(calls[0].url).toBe('https://test-fep.kashier.io/v3/transfers/single');
       expect(calls[0].url).not.toContain('/v2/');
+    });
+
+    // Regression: only the HTTP status was checked. Kashier answers 200 with
+    // status: "FAILURE" in some cases — a disabled feature flag, for instance — and
+    // that was being treated as a successful capture.
+    it('rejects a 200 response that reports FAILURE in the body', async () => {
+      fetchSpy.mockImplementation((async () =>
+        okJson({
+          status: 'FAILURE',
+          messages: { en: 'Capture is not enabled for this merchant' },
+        })) as any);
+
+      await expect(kashierService.capturePayment('ORDER-X', 150)).rejects.toThrow(
+        /FAILURE/,
+      );
+    });
+
+    it('accepts a transfer creation that reports PENDING rather than SUCCESS', async () => {
+      // Demanding SUCCESS would break payouts: a created transfer legitimately
+      // reports PENDING
+      fetchSpy.mockImplementation((async () =>
+        okJson({ data: [{ transferId: 'TRS-9', status: 'PENDING' }] })) as any);
+
+      const res = await kashierService.createTransfer({
+        amount: 10,
+        method: 'wallet',
+        recipientName: 'X',
+        recipientNumber: '01111111111',
+        merchantTransferId: 'wd-9',
+      });
+
+      expect(res.transferId).toBe('TRS-9');
+    });
+
+    it('returns the capture transactionId so a later void or refund can target it', async () => {
+      fetchSpy.mockImplementation((async () =>
+        okJson({
+          status: 'SUCCESS',
+          transactionId: 'TX-2670193217974',
+          response: { status: 'CAPTURED', transactionId: 'TX-2670193217974' },
+        })) as any);
+
+      const res = await kashierService.capturePayment('ORDER-Y', 150);
+
+      expect(res.transactionId).toBe('TX-2670193217974');
+    });
+
+    it('sends targetTransactionId on a refund when one is known', async () => {
+      await kashierService.refundPayment('ORDER-Z', 50, 'TX-123');
+
+      expect(calls[0].method).toBe('PUT');
+      expect(calls[0].body.apiOperation).toBe('REFUND');
+      expect(calls[0].body.transaction).toEqual({
+        amount: 50,
+        targetTransactionId: 'TX-123',
+      });
+    });
+
+    it('omits targetTransactionId when none is known', async () => {
+      await kashierService.refundPayment('ORDER-Z', 50);
+
+      expect(calls[0].body.transaction).toEqual({ amount: 50 });
+    });
+
+    it('reads order status by merchantOrderId from the api host', async () => {
+      fetchSpy.mockImplementation((async (url: any, init: any) => {
+        calls.push({
+          url: String(url),
+          method: init?.method ?? 'GET',
+          body: init?.body ? JSON.parse(init.body) : undefined,
+        });
+        return okJson({ response: { status: 'CAPTURED', totalCapturedAmount: 99 } });
+      }) as any);
+
+      const status = await kashierService.getOrderStatus('booking-uuid');
+
+      expect(calls[0].method).toBe('GET');
+      expect(calls[0].url).toBe('https://test-api.kashier.io/payments/orders/booking-uuid');
+      expect(status).toBe('CAPTURED');
+    });
+
+    it('order status returns null without an order id instead of calling out', async () => {
+      const status = await kashierService.getOrderStatus(null);
+
+      expect(status).toBeNull();
+      expect(calls).toHaveLength(0);
     });
 
     it('extracts the session id from the checkout url', async () => {

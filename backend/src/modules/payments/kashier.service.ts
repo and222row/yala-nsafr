@@ -47,6 +47,24 @@ export class KashierService {
     };
   }
 
+  /**
+   * Kashier can answer HTTP 200 while reporting failure in the body — that is the shape
+   * a disabled feature flag produces, for instance. A 200 alone therefore proves
+   * nothing, and treating it as success once recorded a capture Kashier had declined.
+   *
+   * Only an explicit FAILURE is rejected: order operations report status SUCCESS on the
+   * happy path, while a created transfer reports PENDING, so demanding SUCCESS would
+   * break payouts.
+   */
+  private assertNotFailure(path: string, payload: unknown): void {
+    const status = (payload as Record<string, unknown> | null)?.['status'];
+    if (typeof status === 'string' && status.toUpperCase() === 'FAILURE') {
+      throw new Error(
+        `Kashier reported FAILURE for ${path}: ${JSON.stringify(payload).slice(0, 500)}`,
+      );
+    }
+  }
+
   private async post<T>(path: string, body: unknown, base = this.baseUrl): Promise<T> {
     const res = await fetch(`${base}${path}`, {
       method: 'POST',
@@ -58,7 +76,9 @@ export class KashierService {
       const text = await res.text();
       throw new Error(`Kashier API error ${res.status}: ${text}`);
     }
-    return res.json() as Promise<T>;
+    const payload = (await res.json()) as T;
+    this.assertNotFailure(path, payload);
+    return payload;
   }
 
   private async get<T>(path: string): Promise<T> {
@@ -105,7 +125,9 @@ export class KashierService {
       const text = await res.text();
       throw new Error(`Kashier API error ${res.status}: ${text}`);
     }
-    return res.json() as Promise<T>;
+    const payload = (await res.json()) as T;
+    this.assertNotFailure(path, payload);
+    return payload;
   }
 
   // ── Payment Sessions ────────────────────────────────────────────────────────
@@ -167,16 +189,50 @@ export class KashierService {
 
   // ── Capture / Release ───────────────────────────────────────────────────────
 
-  async capturePayment(orderId: string, amount: number): Promise<void> {
+  /**
+   * Returns the capture's own transactionId (TX-…) when Kashier provides it. That value
+   * is what a later void or refund passes as transaction.targetTransactionId, so it is
+   * worth persisting — it cannot be derived from anything else we hold.
+   */
+  async capturePayment(
+    orderId: string,
+    amount: number,
+  ): Promise<{ transactionId: string | null }> {
     if (this.isMock) {
       this.logger.warn(`PAYMENT_MOCK: mock capture for order ${orderId}`);
-      return;
+      return { transactionId: null };
     }
-    await this.put(`/v3/orders/${orderId}`, {
+    const res = await this.put<Record<string, any>>(`/v3/orders/${orderId}`, {
       apiOperation: 'CAPTURE',
       transaction: { amount },
     });
-    this.logger.log(`Captured ${amount} EGP for order ${orderId}`);
+    const transactionId =
+      res?.['transactionId'] ?? res?.['response']?.['transactionId'] ?? null;
+    this.logger.log(
+      `Captured ${amount} EGP for order ${orderId}` +
+        (transactionId ? ` (transaction ${transactionId})` : ''),
+    );
+    return { transactionId: transactionId ? String(transactionId) : null };
+  }
+
+  /**
+   * Order state straight from Kashier, keyed by the merchantOrderId we assigned. More
+   * dependable than the session lookup, which needs a sessionId parsed out of the
+   * checkout URL and is simply absent on older payments.
+   * Returns null when the state cannot be read — callers must treat that as unknown.
+   */
+  async getOrderStatus(merchantOrderId?: string | null): Promise<string | null> {
+    if (this.isMock || !merchantOrderId) return null;
+    try {
+      const res = await this.get<Record<string, any>>(
+        `/payments/orders/${merchantOrderId}`,
+      );
+      const raw = res?.['response']?.['status'] ?? res?.['status'] ?? null;
+      return raw ? String(raw).toUpperCase() : null;
+    } catch (e) {
+      this.logger.error(`getOrderStatus error for ${merchantOrderId}: ${String(e)}`);
+      return null;
+    }
   }
 
   // Releasing an authorization is a VOID — Kashier has no RELEASE operation.
@@ -194,14 +250,24 @@ export class KashierService {
     this.logger.log(`Voided (released) order ${orderId}`);
   }
 
-  async refundPayment(orderId: string, amount: number): Promise<void> {
+  // targetTransactionId names which transaction on the order to refund. Omitting it
+  // makes Kashier refund against the order's pay transaction, which is only correct
+  // when there is exactly one.
+  async refundPayment(
+    orderId: string,
+    amount: number,
+    targetTransactionId?: string,
+  ): Promise<void> {
     if (this.isMock) {
       this.logger.warn(`PAYMENT_MOCK: mock refund ${amount} for order ${orderId}`);
       return;
     }
     await this.put(`/v3/orders/${orderId}`, {
       apiOperation: 'REFUND',
-      transaction: { amount },
+      transaction: {
+        amount,
+        ...(targetTransactionId ? { targetTransactionId } : {}),
+      },
     });
     this.logger.log(`Refunded ${amount} EGP for order ${orderId}`);
   }
