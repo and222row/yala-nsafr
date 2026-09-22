@@ -25,5 +25,11 @@ export class UpdateConfigDto {
   @IsNumber()
   @Type(() => Number)
   @IsPositive()
+  disputeSlaHours?: number;
+
+  @IsOptional()
+  @IsNumber()
+  @Type(() => Number)
+  @IsPositive()
   ratingRevealDays?: number;
 }

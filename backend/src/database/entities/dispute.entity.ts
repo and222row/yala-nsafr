@@ -18,6 +18,13 @@ export enum DisputeStatus {
   CLOSED = 'closed',
 }
 
+/**
+ * Evidence attachments a single party may put on one dispute. Requests over the limit
+ * are rejected rather than trimmed — silently dropping the last few photos left people
+ * believing they had submitted evidence the admin never saw.
+ */
+export const MAX_DISPUTE_EVIDENCE = 10;
+
 export enum DisputeReason {
   NO_SHOW_DRIVER = 'no_show_driver',
   NO_SHOW_PASSENGER = 'no_show_passenger',

@@ -29,6 +29,7 @@ export const CONFIG_KEYS = {
   COMMISSION_RATE: 'commission_rate',
   AUTO_CONFIRM_HOURS: 'auto_confirm_hours',
   DISPUTE_WINDOW_HOURS: 'dispute_window_hours',
+  DISPUTE_SLA_HOURS: 'dispute_sla_hours',
   RATING_REVEAL_DAYS: 'rating_reveal_days',
   LOW_RATING_THRESHOLD: 'low_rating_threshold',
   MIN_RATINGS_FOR_FLAG: 'min_ratings_for_flag',

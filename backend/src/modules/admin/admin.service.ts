@@ -10,7 +10,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource, ILike, In, LessThan } from 'typeorm';
 import { User, UserStatus } from '../../database/entities/user.entity';
 import { Trip, TripStatus } from '../../database/entities/trip.entity';
-import { Booking, BookingStatus } from '../../database/entities/booking.entity';
+import { Booking, BookingStatus, PaymentMethod } from '../../database/entities/booking.entity';
 import { Payment, PaymentStatus } from '../../database/entities/payment.entity';
 import { Dispute, DisputeStatus, DisputeReason } from '../../database/entities/dispute.entity';
 import { PlatformConfig, CONFIG_KEYS } from '../../database/entities/platform-config.entity';
@@ -20,6 +20,10 @@ import { NotifyPartyDto } from './dto/notify-party.dto';
 import { UpdateConfigDto } from './dto/update-config.dto';
 import { ListUsersQueryDto, ListDisputesQueryDto, ListTripsQueryDto } from './dto/list-query.dto';
 import { NotificationsService } from '../notifications/notifications.service';
+import {
+  PaymentSettlementService,
+  PaymentSettlement,
+} from '../payments/payment-settlement.service';
 
 @Injectable()
 export class AdminService implements OnModuleInit {
@@ -40,6 +44,7 @@ export class AdminService implements OnModuleInit {
     private readonly configRepo: Repository<PlatformConfig>,
     private readonly dataSource: DataSource,
     private readonly notifications: NotificationsService,
+    private readonly settlement: PaymentSettlementService,
   ) {}
 
   // ── Seed default config on first run ──────────────────────────────────────
@@ -48,6 +53,7 @@ export class AdminService implements OnModuleInit {
       { key: CONFIG_KEYS.COMMISSION_RATE, value: '0.10', description: 'Platform commission rate (0–0.5)' },
       { key: CONFIG_KEYS.AUTO_CONFIRM_HOURS, value: '2', description: 'Hours after departure to auto-confirm trip completion' },
       { key: CONFIG_KEYS.DISPUTE_WINDOW_HOURS, value: '48', description: 'Hours after trip to open a dispute' },
+      { key: CONFIG_KEYS.DISPUTE_SLA_HOURS, value: '48', description: 'Hours the other party has to respond before a dispute auto-resolves' },
       { key: CONFIG_KEYS.RATING_REVEAL_DAYS, value: '7', description: 'Days before ratings are revealed if partner has not rated' },
       { key: CONFIG_KEYS.LOW_RATING_THRESHOLD, value: '2.5', description: 'Average rating below which an account is trust-flagged' },
       { key: CONFIG_KEYS.MIN_RATINGS_FOR_FLAG, value: '5', description: 'Minimum ratings before trust-flag check applies' },
@@ -82,6 +88,9 @@ export class AdminService implements OnModuleInit {
     }
     if (dto.disputeWindowHours !== undefined) {
       updates.push({ key: CONFIG_KEYS.DISPUTE_WINDOW_HOURS, value: String(dto.disputeWindowHours) });
+    }
+    if (dto.disputeSlaHours !== undefined) {
+      updates.push({ key: CONFIG_KEYS.DISPUTE_SLA_HOURS, value: String(dto.disputeSlaHours) });
     }
     if (dto.ratingRevealDays !== undefined) {
       updates.push({ key: CONFIG_KEYS.RATING_REVEAL_DAYS, value: String(dto.ratingRevealDays) });
@@ -257,9 +266,111 @@ export class AdminService implements OnModuleInit {
     return this.disputeRepo.save(dispute);
   }
 
+  /**
+   * Works out what the gateway owes whom for a dispute outcome. Returns null when there
+   * is nothing to move — a cash fare, or a payment already sitting in the right state.
+   *
+   * The money semantics per outcome:
+   *  - refund  → passenger gets everything back: void an untouched hold, refund a capture
+   *  - release → driver keeps the fare, so the hold must be *captured*
+   *  - split   → capture the fare, then hand the agreed slice back to the passenger
+   */
+  private planDisputeSettlement(
+    payment: Payment | null | undefined,
+    isCash: boolean,
+    resolution: DisputeStatus,
+    refund: number,
+  ): PaymentSettlement | null {
+    if (!payment || isCash) return null;
+
+    const orderId = payment.gatewayTransactionId ?? payment.gatewayOrderId;
+    if (!orderId) return null;
+
+    const targetTransactionId = payment.kashierTransactionId ?? undefined;
+    const amount = Number(payment.amount);
+    const alreadyRefunded = Number(payment.refundAmount ?? 0);
+    const outstanding = +(amount - alreadyRefunded).toFixed(2);
+    const base = { paymentId: payment.id, orderId, targetTransactionId };
+
+    switch (resolution) {
+      case DisputeStatus.RESOLVED_REFUND:
+        // Nothing has been taken yet — voiding the hold is cheaper and faster than
+        // capturing only to refund, and is exempt from Kashier's void window.
+        if (payment.status === PaymentStatus.PENDING) {
+          return { ...base, action: 'void' };
+        }
+        if (
+          payment.status === PaymentStatus.CAPTURED ||
+          payment.status === PaymentStatus.PARTIALLY_REFUNDED
+        ) {
+          if (outstanding <= 0) return null;
+          return {
+            ...base,
+            action: 'refund',
+            refundAmount: outstanding,
+            recordRefundAmount: amount,
+            fullRefund: true,
+          };
+        }
+        return null; // already RELEASED or REFUNDED
+
+      case DisputeStatus.RESOLVED_RELEASE:
+        // The driver won, so the authorization has to actually be collected. This branch
+        // used to write status = RELEASED, which means the opposite — that is the label
+        // for a voided hold — and left the winning driver's payout at zero.
+        if (payment.status === PaymentStatus.PENDING) {
+          return { ...base, action: 'capture', captureAmount: amount };
+        }
+        return null; // already captured; nothing to move
+
+      case DisputeStatus.RESOLVED_SPLIT: {
+        const toRefund = Math.min(refund, outstanding);
+        if (toRefund <= 0) {
+          // Degenerate split: the driver keeps it all, same as a release
+          return payment.status === PaymentStatus.PENDING
+            ? { ...base, action: 'capture', captureAmount: amount }
+            : null;
+        }
+        const recordRefundAmount = +(alreadyRefunded + toRefund).toFixed(2);
+        const fullRefund = recordRefundAmount >= amount;
+        if (payment.status === PaymentStatus.PENDING) {
+          return {
+            ...base,
+            action: 'capture_then_refund',
+            captureAmount: amount,
+            refundAmount: toRefund,
+            recordRefundAmount,
+            fullRefund,
+          };
+        }
+        if (
+          payment.status === PaymentStatus.CAPTURED ||
+          payment.status === PaymentStatus.PARTIALLY_REFUNDED
+        ) {
+          return {
+            ...base,
+            action: 'refund',
+            refundAmount: toRefund,
+            recordRefundAmount,
+            fullRefund,
+          };
+        }
+        return null;
+      }
+
+      default:
+        return null;
+    }
+  }
+
   async resolveDispute(disputeId: string, adminId: string, dto: ResolveDisputeDto): Promise<Dispute> {
-    return this.dataSource.transaction(async (manager) => {
-      const dispute = await manager.findOne(Dispute, { where: { id: disputeId } });
+    let settlement: PaymentSettlement | null = null;
+
+    const resolved = await this.dataSource.transaction(async (manager) => {
+      const dispute = await manager.findOne(Dispute, {
+        where: { id: disputeId },
+        lock: { mode: 'pessimistic_write' },
+      });
       if (!dispute) throw new NotFoundException('Dispute not found');
       if (
         dispute.status !== DisputeStatus.OPEN &&
@@ -275,43 +386,38 @@ export class AdminService implements OnModuleInit {
       if (!booking) throw new NotFoundException('Booking not found');
 
       const payment = booking.payment;
+      const isCash = booking.paymentMethod === PaymentMethod.CASH || !!payment?.isCash;
+      const refund = dto.refundAmount ?? 0;
 
+      if (dto.resolution === DisputeStatus.RESOLVED_SPLIT) {
+        if (refund <= 0) {
+          throw new BadRequestException('A split resolution needs a refundAmount above zero');
+        }
+        if (refund > Number(booking.totalAmount)) {
+          throw new BadRequestException('refundAmount cannot exceed the amount paid');
+        }
+      }
+
+      // Decided here, executed after this commits. The gateway must never be called
+      // inside the transaction: a capture that succeeds followed by a refund that fails
+      // would roll the record back while the passenger's money had already moved.
+      settlement = this.planDisputeSettlement(payment, isCash, dto.resolution, refund);
+
+      // Only the booking is advanced here. The payment row is moved by the settlement
+      // step as each gateway call succeeds, so a Kashier outage leaves a completed
+      // booking with a still-PENDING payment — which reconciliation picks up — rather
+      // than a record claiming money moved when it did not.
       switch (dto.resolution) {
-        case DisputeStatus.RESOLVED_REFUND: {
-          // Full refund to passenger
+        case DisputeStatus.RESOLVED_REFUND:
           booking.status = BookingStatus.REFUNDED;
-          if (payment) {
-            payment.status = PaymentStatus.REFUNDED;
-            payment.refundedAt = new Date();
-            payment.refundAmount = payment.amount;
-            await manager.save(Payment, payment);
-          }
           break;
-        }
-        case DisputeStatus.RESOLVED_RELEASE: {
-          // Full payout to driver
+        case DisputeStatus.RESOLVED_RELEASE:
+        case DisputeStatus.RESOLVED_SPLIT:
           booking.status = BookingStatus.TRIP_COMPLETED;
-          booking.completedAt = new Date();
-          if (payment) {
-            payment.status = PaymentStatus.RELEASED;
-            payment.releasedAt = new Date();
-            await manager.save(Payment, payment);
-          }
+          // Keep the original completion date if the trip had already finished —
+          // earnings bucket payouts by month from this field.
+          booking.completedAt = booking.completedAt ?? new Date();
           break;
-        }
-        case DisputeStatus.RESOLVED_SPLIT: {
-          // Partial refund — refundAmount goes back to passenger, rest to driver
-          const refund = dto.refundAmount ?? 0;
-          if (payment && refund > 0) {
-            payment.status = PaymentStatus.PARTIALLY_REFUNDED;
-            payment.refundAmount = refund;
-            payment.refundedAt = new Date();
-            await manager.save(Payment, payment);
-          }
-          booking.status = BookingStatus.TRIP_COMPLETED;
-          booking.completedAt = new Date();
-          break;
-        }
       }
 
       await manager.save(Booking, booking);
@@ -322,7 +428,7 @@ export class AdminService implements OnModuleInit {
       if (dto.refundAmount !== undefined) dispute.refundAmount = dto.refundAmount;
       dispute.resolvedAt = new Date();
 
-      const resolved = await manager.save(Dispute, dispute);
+      const saved = await manager.save(Dispute, dispute);
 
       // Optional: block a user as part of the decision
       if (dto.blockUserId && dto.blockStatus) {
@@ -331,10 +437,15 @@ export class AdminService implements OnModuleInit {
 
       const outcomeLabel: Record<string, string> = {
         [DisputeStatus.RESOLVED_REFUND]: 'تم البت في النزاع: استرداد المبلغ للراكب.',
-        [DisputeStatus.RESOLVED_RELEASE]: 'تم البت في النزاع: الإفراج عن المبلغ للسائق.',
-        [DisputeStatus.RESOLVED_SPLIT]: 'تم البت في النزاع: تقسيم المبلغ بين الطرفين.',
+        [DisputeStatus.RESOLVED_RELEASE]: 'تم البت في النزاع: صرف المبلغ للسائق.',
+        [DisputeStatus.RESOLVED_SPLIT]: `تم البت في النزاع: استرداد ${dto.refundAmount ?? 0} جنيه للراكب والباقي للسائق.`,
       };
-      const outcomeText = outcomeLabel[dto.resolution] ?? 'تم البت في النزاع.';
+      // Cash never passes through Kashier, so promising an automatic transfer would be
+      // untrue — the parties settle it between themselves.
+      const cashNote = isCash
+        ? ' الرحلة كانت بالدفع النقدي، لذا تتم التسوية المالية بين الطرفين مباشرةً.'
+        : '';
+      const outcomeText = (outcomeLabel[dto.resolution] ?? 'تم البت في النزاع.') + cashNote;
 
       setImmediate(() => {
         void this.notifications.sendToUsers(
@@ -349,8 +460,12 @@ export class AdminService implements OnModuleInit {
         );
       });
 
-      return resolved;
+      return saved;
     });
+
+    await this.settlement.settle(settlement, `dispute ${disputeId}`);
+
+    return resolved;
   }
 
   async notifyParty(disputeId: string, adminId: string, dto: NotifyPartyDto): Promise<void> {
@@ -392,6 +507,8 @@ export class AdminService implements OnModuleInit {
 
     for (const dispute of expired) {
       try {
+        let settlement: PaymentSettlement | null = null;
+
         await this.dataSource.transaction(async (manager) => {
           const booking = await manager.findOne(Booking, {
             where: { id: dispute.bookingId },
@@ -403,6 +520,9 @@ export class AdminService implements OnModuleInit {
           const autoRefundReasons = [DisputeReason.NO_SHOW_DRIVER, DisputeReason.UNSAFE_DRIVING];
           const autoReleaseReasons = [DisputeReason.NO_SHOW_PASSENGER];
 
+          const isCash =
+            booking.paymentMethod === PaymentMethod.CASH || !!booking.payment?.isCash;
+
           let resolution: DisputeStatus;
           let outcomeText: string;
 
@@ -410,22 +530,11 @@ export class AdminService implements OnModuleInit {
             resolution = DisputeStatus.RESOLVED_REFUND;
             outcomeText = 'تم استرداد المبلغ تلقائياً لعدم رد الطرف الآخر في الوقت المحدد.';
             booking.status = BookingStatus.REFUNDED;
-            if (booking.payment) {
-              booking.payment.status = PaymentStatus.REFUNDED;
-              booking.payment.refundedAt = new Date();
-              booking.payment.refundAmount = booking.payment.amount;
-              await manager.save(Payment, booking.payment);
-            }
           } else if (autoReleaseReasons.includes(dispute.reason as DisputeReason)) {
             resolution = DisputeStatus.RESOLVED_RELEASE;
-            outcomeText = 'تم الإفراج عن المبلغ للسائق تلقائياً لعدم رد الطرف الآخر.';
+            outcomeText = 'تم صرف المبلغ للسائق تلقائياً لعدم رد الطرف الآخر.';
             booking.status = BookingStatus.TRIP_COMPLETED;
-            booking.completedAt = new Date();
-            if (booking.payment) {
-              booking.payment.status = PaymentStatus.RELEASED;
-              booking.payment.releasedAt = new Date();
-              await manager.save(Payment, booking.payment);
-            }
+            booking.completedAt = booking.completedAt ?? new Date();
           } else {
             // Ambiguous reasons → escalate to manual review instead of auto-resolving
             dispute.status = DisputeStatus.UNDER_REVIEW;
@@ -443,12 +552,22 @@ export class AdminService implements OnModuleInit {
             return;
           }
 
+          // Same rule as a manual resolution: plan the gateway work here, run it after
+          // the commit. The previous version wrote REFUNDED/RELEASED straight onto the
+          // payment and never called Kashier at all, so the passenger was told their
+          // money was on the way while the authorization quietly expired.
+          settlement = this.planDisputeSettlement(booking.payment, isCash, resolution, 0);
+
           await manager.save(Booking, booking);
 
           dispute.status = resolution;
           dispute.resolutionNotes = outcomeText;
           dispute.resolvedAt = new Date();
           await manager.save(Dispute, dispute);
+
+          const cashNote = isCash
+            ? ' الرحلة كانت بالدفع النقدي، لذا تتم التسوية المالية بين الطرفين مباشرةً.'
+            : '';
 
           setImmediate(() => {
             void this.notifications.sendToUsers(
@@ -457,12 +576,14 @@ export class AdminService implements OnModuleInit {
               ),
               {
                 title: 'تم البت في النزاع تلقائياً',
-                body: outcomeText,
+                body: outcomeText + cashNote,
                 data: { disputeId: dispute.id, screen: 'dispute_detail' },
               },
             );
           });
         });
+
+        await this.settlement.settle(settlement, `dispute SLA ${dispute.id}`);
       } catch (err) {
         this.logger.error(`SLA auto-resolve failed for dispute ${dispute.id}: ${err}`);
       }

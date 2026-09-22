@@ -71,6 +71,14 @@ export class EarningsService {
         // and paying out against it would send money we never received.
         allTimeOnline += payout;
         if (isThisMonth) thisMonthOnline += payout;
+      } else if (b.payment?.status === PaymentStatus.PARTIALLY_REFUNDED) {
+        // A split dispute ruling captures the fare and returns an agreed slice to the
+        // passenger. The driver keeps the rest, so the payout is reduced by what went
+        // back rather than dropping to zero — which is what happened while this status
+        // was not counted at all.
+        const net = Math.max(0, +(payout - Number(b.payment.refundAmount ?? 0)).toFixed(2));
+        allTimeOnline += net;
+        if (isThisMonth) thisMonthOnline += net;
       }
     }
 
@@ -372,7 +380,7 @@ export class EarningsService {
         .leftJoin('b.payment', 'p')
         .select('COALESCE(SUM(b.commission_amount), 0)', 'total')
         .addSelect(
-          `COALESCE(SUM(CASE WHEN p.status = '${PaymentStatus.CAPTURED}' THEN b.commission_amount ELSE 0 END), 0)`,
+          `COALESCE(SUM(CASE WHEN p.status IN ('${PaymentStatus.CAPTURED}', '${PaymentStatus.PARTIALLY_REFUNDED}') THEN b.commission_amount ELSE 0 END), 0)`,
           'captured',
         )
         .addSelect(

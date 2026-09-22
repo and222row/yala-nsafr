@@ -14,26 +14,23 @@ import { Payment, PaymentStatus } from '../../database/entities/payment.entity';
 import { Trip, TripStatus } from '../../database/entities/trip.entity';
 import { User, Gender } from '../../database/entities/user.entity';
 import { ReferralReward } from '../../database/entities/referral-reward.entity';
-import { Dispute, DisputeStatus } from '../../database/entities/dispute.entity';
+import {
+  Dispute,
+  DisputeStatus,
+  MAX_DISPUTE_EVIDENCE,
+} from '../../database/entities/dispute.entity';
 import { PlatformConfig, CONFIG_KEYS } from '../../database/entities/platform-config.entity';
 import { CreateBookingDto } from './dto/create-booking.dto';
 import { OpenDisputeDto } from '../admin/dto/open-dispute.dto';
 import { NotificationsService } from '../notifications/notifications.service';
 import { KashierService } from '../payments/kashier.service';
+import {
+  PaymentSettlementService,
+  PaymentSettlement,
+} from '../payments/payment-settlement.service';
 
 // Auto-confirm 2 hours after departure time if no dispute
 const AUTO_CONFIRM_HOURS = 2;
-
-/** What the gateway still has to do once a cancellation has been committed. */
-type CancellationSettlement = {
-  paymentId: string;
-  orderId: string;
-  targetTransactionId?: string;
-  action: 'void' | 'capture' | 'capture_then_refund' | 'refund';
-  captureAmount?: number;
-  refundAmount?: number;
-  fullRefund?: boolean;
-};
 
 @Injectable()
 export class BookingsService {
@@ -52,6 +49,7 @@ export class BookingsService {
     private readonly config: ConfigService,
     private readonly notifications: NotificationsService,
     private readonly kashier: KashierService,
+    private readonly settlement: PaymentSettlementService,
   ) {}
 
   private async getConfigNum(key: string, fallback: number): Promise<number> {
@@ -65,12 +63,28 @@ export class BookingsService {
    * admin-configurable — so they are read here rather than restated in the client.
    */
   async getCancellationPolicy() {
-    const [freeCancelHours, lateCancelHours, lateCancelFeePct] = await Promise.all([
+    const [
+      freeCancelHours,
+      lateCancelHours,
+      lateCancelFeePct,
+      disputeWindowHours,
+      disputeSlaHours,
+    ] = await Promise.all([
       this.getConfigNum(CONFIG_KEYS.FREE_CANCEL_HOURS, 48),
       this.getConfigNum(CONFIG_KEYS.LATE_CANCEL_HOURS, 2),
       this.getConfigNum(CONFIG_KEYS.LATE_CANCEL_FEE_PCT, 0.15),
+      // Served here too so the dispute screen can state the real deadlines instead of a
+      // hardcoded 48, which would be wrong the moment an admin changes either value.
+      this.getConfigNum(CONFIG_KEYS.DISPUTE_WINDOW_HOURS, 48),
+      this.getConfigNum(CONFIG_KEYS.DISPUTE_SLA_HOURS, 48),
     ]);
-    return { freeCancelHours, lateCancelHours, lateCancelFeePct };
+    return {
+      freeCancelHours,
+      lateCancelHours,
+      lateCancelFeePct,
+      disputeWindowHours,
+      disputeSlaHours,
+    };
   }
 
   /** Read-only: calculate what the passenger would get back if they cancel now. */
@@ -553,7 +567,7 @@ export class BookingsService {
     passenger: User,
     reason?: string,
   ): Promise<Booking & { refundAmount: number; policy: string }> {
-    let settlement: CancellationSettlement | null = null;
+    let settlement: PaymentSettlement | null = null;
 
     const result = await this.dataSource.transaction(async (manager) => {
       const booking = await manager.findOne(Booking, {
@@ -716,86 +730,11 @@ export class BookingsService {
 
     // Settled after the booking is safely cancelled. A gateway outage must not keep the
     // passenger on a booking they cancelled, so the money is reconciled separately.
-    await this.settleCancelledPayment(settlement);
+    await this.settlement.settle(settlement, 'cancelled booking');
 
     return result;
   }
 
-  /**
-   * Performs the gateway side of a cancellation. Each step is persisted as soon as it
-   * succeeds, so a capture that goes through followed by a failed refund is recorded as
-   * captured-and-refund-owed rather than being lost — which is what happened when these
-   * calls ran inside the cancelling transaction and a failure rolled the record back.
-   */
-  private async settleCancelledPayment(intent: CancellationSettlement | null): Promise<void> {
-    if (!intent) return;
-
-    try {
-      switch (intent.action) {
-        case 'void':
-          await this.kashier.releasePayment(intent.orderId, intent.targetTransactionId);
-          await this.paymentRepo.update(intent.paymentId, {
-            status: PaymentStatus.RELEASED,
-            releasedAt: new Date(),
-          });
-          break;
-
-        case 'capture':
-          await this.kashier.capturePayment(intent.orderId, intent.captureAmount!);
-          await this.paymentRepo.update(intent.paymentId, {
-            status: PaymentStatus.CAPTURED,
-            capturedAt: new Date(),
-          });
-          break;
-
-        case 'capture_then_refund': {
-          const { transactionId } = await this.kashier.capturePayment(
-            intent.orderId,
-            intent.captureAmount!,
-          );
-          // Written before the refund is attempted: if that fails, the record still
-          // shows the money was taken and a refund is outstanding.
-          await this.paymentRepo.update(intent.paymentId, {
-            status: PaymentStatus.CAPTURED,
-            capturedAt: new Date(),
-            ...(transactionId ? { kashierTransactionId: transactionId } : {}),
-          });
-          // Refund the capture we just made, rather than letting Kashier pick a
-          // transaction on the order
-          await this.kashier.refundPayment(
-            intent.orderId,
-            intent.refundAmount!,
-            transactionId ?? undefined,
-          );
-          await this.paymentRepo.update(intent.paymentId, {
-            status: PaymentStatus.PARTIALLY_REFUNDED,
-            refundAmount: intent.refundAmount,
-            refundedAt: new Date(),
-          });
-          break;
-        }
-
-        case 'refund':
-          await this.kashier.refundPayment(
-            intent.orderId,
-            intent.refundAmount!,
-            intent.targetTransactionId,
-          );
-          await this.paymentRepo.update(intent.paymentId, {
-            status: intent.fullRefund
-              ? PaymentStatus.REFUNDED
-              : PaymentStatus.PARTIALLY_REFUNDED,
-            refundAmount: intent.refundAmount,
-            refundedAt: new Date(),
-          });
-          break;
-      }
-    } catch (err) {
-      this.logger.error(
-        `Failed to settle payment ${intent.paymentId} for cancelled booking (${intent.action}): ${err}`,
-      );
-    }
-  }
 
   async getPassengerBookings(passengerId: string): Promise<(Booking & { hasRated: boolean })[]> {
     const bookings = await this.bookingRepo.find({
@@ -925,8 +864,31 @@ export class BookingsService {
       const existing = await manager.findOne(Dispute, { where: { bookingId: dto.bookingId } });
       if (existing) throw new BadRequestException('A dispute already exists for this booking');
 
+      if ((dto.evidenceUrls?.length ?? 0) > MAX_DISPUTE_EVIDENCE) {
+        throw new BadRequestException(
+          `Attach at most ${MAX_DISPUTE_EVIDENCE} pieces of evidence`,
+        );
+      }
+
+      const [disputeWindowHours, slaHours] = await Promise.all([
+        this.getConfigNum(CONFIG_KEYS.DISPUTE_WINDOW_HOURS, 48),
+        this.getConfigNum(CONFIG_KEYS.DISPUTE_SLA_HOURS, 48),
+      ]);
+
+      // The dispute window exists because the money behind a dispute has to still be
+      // movable: an authorization lapses and Kashier will not refund a capture forever.
+      // Measured from completion where we have it, otherwise from departure; a trip that
+      // has not run yet gives a negative age and is always disputable.
+      const reference = booking.completedAt ?? booking.trip.departureTime;
+      const hoursSinceTrip = (Date.now() - reference.getTime()) / 3_600_000;
+      if (hoursSinceTrip > disputeWindowHours) {
+        throw new BadRequestException(
+          `Disputes must be opened within ${disputeWindowHours} hours of the trip`,
+        );
+      }
+
       const slaDeadline = new Date();
-      slaDeadline.setHours(slaDeadline.getHours() + 48);
+      slaDeadline.setTime(slaDeadline.getTime() + slaHours * 3_600_000);
 
       booking.status = BookingStatus.DISPUTED;
       await manager.save(Booking, booking);
@@ -957,8 +919,8 @@ export class BookingsService {
 
       setImmediate(() => {
         void this.notifications.sendToUser(otherPartyId, {
-          title: 'Dispute opened on your trip',
-          body: 'A dispute has been opened on one of your bookings. Please submit your response within 48 hours.',
+          title: 'تم فتح نزاع على رحلتك',
+          body: `تم فتح نزاع على أحد حجوزاتك. يُرجى إرسال ردك خلال ${slaHours} ساعة.`,
           data: { disputeId: saved.id, bookingId: booking.id, screen: 'dispute_detail' },
         });
       });

@@ -9,11 +9,13 @@ import { Booking } from '../../database/entities/booking.entity';
 import { Payment } from '../../database/entities/payment.entity';
 import { Dispute } from '../../database/entities/dispute.entity';
 import { PlatformConfig } from '../../database/entities/platform-config.entity';
+import { PaymentsModule } from '../payments/payments.module';
 
 @Module({
   imports: [
     ScheduleModule.forRoot(),
     TypeOrmModule.forFeature([User, Trip, Booking, Payment, Dispute, PlatformConfig]),
+    PaymentsModule,
   ],
   controllers: [AdminController],
   providers: [AdminService],

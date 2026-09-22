@@ -6,7 +6,11 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { Dispute, DisputeStatus } from '../../database/entities/dispute.entity';
+import {
+  Dispute,
+  DisputeStatus,
+  MAX_DISPUTE_EVIDENCE,
+} from '../../database/entities/dispute.entity';
 import { Booking } from '../../database/entities/booking.entity';
 import { User } from '../../database/entities/user.entity';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -109,6 +113,22 @@ export class DisputesService {
     };
   }
 
+  /**
+   * Appends to an evidence list, rejecting the whole request if it would exceed the cap.
+   * This used to `.slice(0, 10)` the result, so the eleventh photo vanished without
+   * telling anyone — the submitter thought the admin had it.
+   */
+  private appendEvidence(existing: string[] | null, incoming: string[]): string[] {
+    const merged = [...(existing ?? []), ...incoming];
+    if (merged.length > MAX_DISPUTE_EVIDENCE) {
+      throw new BadRequestException(
+        `You can attach at most ${MAX_DISPUTE_EVIDENCE} pieces of evidence to a dispute ` +
+          `(you already have ${(existing ?? []).length})`,
+      );
+    }
+    return merged;
+  }
+
   async addEvidence(disputeId: string, user: User, dto: AddEvidenceDto): Promise<Dispute> {
     const { dispute, isOpener } = await this.loadWithAccess(disputeId, user);
 
@@ -119,19 +139,23 @@ export class DisputesService {
       throw new BadRequestException('Cannot add evidence to a closed dispute');
     }
 
-    if (!isOpener) {
-      throw new ForbiddenException(
-        'Only the dispute opener can add evidence here. Use the respond endpoint instead.',
+    // Either party may add evidence, and may keep adding it while the dispute is open.
+    // Previously only the opener could, which meant the responding party had exactly one
+    // chance to attach anything — a photo found later could not be submitted at all.
+    if (isOpener) {
+      dispute.evidenceUrls = this.appendEvidence(dispute.evidenceUrls, dto.evidenceUrls);
+    } else {
+      dispute.otherPartyEvidenceUrls = this.appendEvidence(
+        dispute.otherPartyEvidenceUrls,
+        dto.evidenceUrls,
       );
     }
 
-    const existing = dispute.evidenceUrls ?? [];
-    dispute.evidenceUrls = [...existing, ...dto.evidenceUrls].slice(0, 10);
     return this.disputeRepo.save(dispute);
   }
 
   async respond(disputeId: string, user: User, dto: RespondToDisputeDto): Promise<Dispute> {
-    const { dispute, isOtherParty, otherPartyId } = await this.loadWithAccess(disputeId, user);
+    const { dispute, isOtherParty } = await this.loadWithAccess(disputeId, user);
 
     if (!isOtherParty) {
       throw new ForbiddenException(
@@ -146,20 +170,30 @@ export class DisputesService {
       throw new BadRequestException('Dispute is no longer open for responses');
     }
 
-    if (dispute.otherPartyResponse) {
-      throw new BadRequestException('You have already submitted your response');
-    }
+    // A follow-up is appended rather than rejected. Someone who remembers a detail after
+    // sending their first reply had no way to add it, and overwriting would have destroyed
+    // the statement the admin may already have read.
+    const isFollowUp = !!dispute.otherPartyResponse;
+    dispute.otherPartyResponse = isFollowUp
+      ? `${dispute.otherPartyResponse}\n\n— إضافة (${new Date().toISOString()}):\n${dto.response}`
+      : dto.response;
 
-    dispute.otherPartyResponse = dto.response;
-    dispute.otherPartyEvidenceUrls = dto.evidenceUrls ?? [];
+    if (dto.evidenceUrls?.length) {
+      dispute.otherPartyEvidenceUrls = this.appendEvidence(
+        dispute.otherPartyEvidenceUrls,
+        dto.evidenceUrls,
+      );
+    }
 
     const saved = await this.disputeRepo.save(dispute);
 
     // Notify the opener that the other party has responded
     setImmediate(() => {
       void this.notifications.sendToUser(dispute.openedByUserId, {
-        title: 'Response received on your dispute',
-        body: 'The other party has submitted their response. Our team will review both sides shortly.',
+        title: isFollowUp ? 'رد إضافي على نزاعك' : 'وصل رد على نزاعك',
+        body: isFollowUp
+          ? 'أضاف الطرف الآخر تفاصيل جديدة إلى رده. سيراجع فريقنا كل ما تم تقديمه.'
+          : 'قدّم الطرف الآخر رده. سيراجع فريقنا وجهتي النظر قريباً.',
         data: { disputeId: saved.id, screen: 'dispute_detail' },
       });
     });

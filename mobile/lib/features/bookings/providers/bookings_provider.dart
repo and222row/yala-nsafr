@@ -23,11 +23,17 @@ class CancellationPolicy {
   final double freeCancelHours;
   final double lateCancelHours;
   final double lateCancelFeePct;
+  // Dispute deadlines ride along on the same endpoint so the dispute screens can state
+  // the real numbers the backend enforces instead of a hardcoded 48.
+  final double disputeWindowHours;
+  final double disputeSlaHours;
 
   const CancellationPolicy({
     required this.freeCancelHours,
     required this.lateCancelHours,
     required this.lateCancelFeePct,
+    required this.disputeWindowHours,
+    required this.disputeSlaHours,
   });
 
   int get feePercent => (lateCancelFeePct * 100).round();
@@ -36,6 +42,9 @@ class CancellationPolicy {
         freeCancelHours: double.tryParse(j['freeCancelHours']?.toString() ?? '') ?? 48,
         lateCancelHours: double.tryParse(j['lateCancelHours']?.toString() ?? '') ?? 2,
         lateCancelFeePct: double.tryParse(j['lateCancelFeePct']?.toString() ?? '') ?? 0.15,
+        disputeWindowHours:
+            double.tryParse(j['disputeWindowHours']?.toString() ?? '') ?? 48,
+        disputeSlaHours: double.tryParse(j['disputeSlaHours']?.toString() ?? '') ?? 48,
       );
 }
 

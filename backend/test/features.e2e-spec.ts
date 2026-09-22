@@ -32,6 +32,9 @@ import { NotificationsService } from '../src/modules/notifications/notifications
 import { RatingsService } from '../src/modules/ratings/ratings.service';
 import { Rating, RaterRole } from '../src/database/entities/rating.entity';
 import { PlatformConfig, CONFIG_KEYS } from '../src/database/entities/platform-config.entity';
+import { Dispute, DisputeStatus, DisputeReason } from '../src/database/entities/dispute.entity';
+import { DisputesService } from '../src/modules/disputes/disputes.service';
+import { AdminService } from '../src/modules/admin/admin.service';
 import { MessagesService } from '../src/modules/messages/messages.service';
 import { TripMessage } from '../src/database/entities/trip-message.entity';
 import { LocationService } from '../src/modules/location/location.service';
@@ -60,6 +63,8 @@ describe('Features E2E', () => {
   let notificationsService: NotificationsService;
   let ratingsService: RatingsService;
   let messagesService: MessagesService;
+  let disputesService: DisputesService;
+  let adminService: AdminService;
   let locationService: LocationService;
 
   let tripRepo: Repository<Trip>;
@@ -71,6 +76,7 @@ describe('Features E2E', () => {
   let ratingRepo: Repository<Rating>;
   let messageRepo: Repository<TripMessage>;
   let commentRepo: Repository<TripComment>;
+  let disputeRepo: Repository<Dispute>;
 
   let driverUser: User;
   let passengerUser: User;
@@ -105,6 +111,8 @@ describe('Features E2E', () => {
     notificationsService = moduleFixture.get(NotificationsService);
     ratingsService = moduleFixture.get(RatingsService);
     messagesService = moduleFixture.get(MessagesService);
+    disputesService = moduleFixture.get(DisputesService);
+    adminService = moduleFixture.get(AdminService);
     locationService = moduleFixture.get(LocationService);
 
     tripRepo = moduleFixture.get(getRepositoryToken(Trip));
@@ -116,6 +124,7 @@ describe('Features E2E', () => {
     ratingRepo = moduleFixture.get(getRepositoryToken(Rating));
     messageRepo = moduleFixture.get(getRepositoryToken(TripMessage));
     commentRepo = moduleFixture.get(getRepositoryToken(TripComment));
+    disputeRepo = moduleFixture.get(getRepositoryToken(Dispute));
 
     await cleanupTestData();
 
@@ -177,6 +186,7 @@ describe('Features E2E', () => {
       for (const t of trips) {
         await messageRepo.delete({ tripId: t.id });
         await commentRepo.delete({ tripId: t.id });
+        await disputeRepo.delete({ tripId: t.id });
         const bookings = await bookingRepo.find({ where: { tripId: t.id } });
         for (const b of bookings) {
           await paymentRepo.delete({ bookingId: b.id });
@@ -2770,6 +2780,738 @@ describe('Features E2E', () => {
     });
   });
 
+  // ── 23. Dispute flow ─────────────────────────────────────────────────────────
+  // open → other party responds → admin assigns → admin resolves, plus the hourly
+  // SLA job that acts when the other party never replies.
+
+  describe('Dispute flow', () => {
+    async function disputableBooking(
+      paymentStatus = PaymentStatus.CAPTURED,
+      paymentMethod = PaymentMethod.CARD,
+    ) {
+      const trip = await makeTrip({ status: TripStatus.COMPLETED });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.TRIP_COMPLETED,
+        paymentStatus,
+        paymentMethod,
+      });
+      return { trip, booking, payment };
+    }
+
+    /** Spies on every order operation at once, so a test can assert what was *not* called. */
+    function spyOnGateway() {
+      return {
+        capture: jest
+          .spyOn(kashierService, 'capturePayment')
+          .mockResolvedValue({ transactionId: 'dispute-cap-1' }),
+        refund: jest.spyOn(kashierService, 'refundPayment').mockResolvedValue(undefined),
+        release: jest.spyOn(kashierService, 'releasePayment').mockResolvedValue(undefined),
+        notifyOne: jest
+          .spyOn(notificationsService, 'sendToUser')
+          .mockResolvedValue(undefined as any),
+        notifyMany: jest
+          .spyOn(notificationsService, 'sendToUsers')
+          .mockResolvedValue(undefined as any),
+      };
+    }
+
+    async function cleanup(tripId: string, bookingId: string, paymentId: string) {
+      await disputeRepo.delete({ bookingId });
+      await paymentRepo.delete(paymentId);
+      await bookingRepo.delete(bookingId);
+      await tripRepo.delete(tripId);
+      await userRepo.update(driverUser.id, { disputeCount: 0 });
+      await userRepo.update(passengerUser.id, { disputeCount: 0 });
+    }
+
+    it('passenger opens a dispute: booking is flagged and the driver is notified', async () => {
+      const { trip, booking, payment } = await disputableBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.WRONG_ROUTE,
+        description: 'Driver took a longer route',
+      } as any);
+      await waitForBackground();
+
+      expect(dispute.status).toBe(DisputeStatus.OPEN);
+      expect(dispute.openedByUserId).toBe(passengerUser.id);
+      expect(dispute.slaDeadline).not.toBeNull();
+
+      const updatedBooking = await bookingRepo.findOneBy({ id: booking.id });
+      expect(updatedBooking?.status).toBe(BookingStatus.DISPUTED);
+      expect(updatedBooking?.disputeId).toBe(dispute.id);
+
+      // The counter lands on the party being complained about, not the opener
+      const driver = await userRepo.findOneBy({ id: driverUser.id });
+      expect(driver?.disputeCount).toBe(1);
+      const notified = notifySpy.mock.calls.map(([id]) => id);
+      expect(notified).toContain(driverUser.id);
+
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('rejects a second dispute on the same booking', async () => {
+      const { trip, booking, payment } = await disputableBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+
+      await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.OTHER,
+        description: 'first',
+      } as any);
+
+      await expect(
+        bookingsService.openDispute(driverUser, {
+          bookingId: booking.id,
+          reason: DisputeReason.OTHER,
+          description: 'second',
+        } as any),
+      ).rejects.toThrow();
+
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('rejects a dispute from someone who is not a party to the booking', async () => {
+      const { trip, booking, payment } = await disputableBooking();
+      const stranger = await userRepo.save(
+        userRepo.create({
+          phoneNumber: STRANGER_PHONE,
+          fullName: 'E2E Stranger',
+          status: UserStatus.ACTIVE,
+          role: UserRole.PASSENGER,
+          referralCode: 'E2E_DSP1',
+        }),
+      );
+
+      await expect(
+        bookingsService.openDispute(stranger, {
+          bookingId: booking.id,
+          reason: DisputeReason.OTHER,
+          description: 'not mine',
+        } as any),
+      ).rejects.toThrow();
+
+      await userRepo.delete(stranger.id);
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('only the other party may respond, but they may follow up more than once', async () => {
+      const { trip, booking, payment } = await disputableBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.WRONG_ROUTE,
+        description: 'opener account',
+      } as any);
+
+      // The opener cannot use the respond endpoint
+      await expect(
+        disputesService.respond(dispute.id, passengerUser, { response: 'me again' } as any),
+      ).rejects.toThrow();
+
+      const responded = await disputesService.respond(dispute.id, driverUser, {
+        response: 'Route was diverted for roadworks',
+      } as any);
+      expect(responded.otherPartyResponse).toBe('Route was diverted for roadworks');
+
+      // A follow-up is appended, not refused and not overwriting the first statement
+      const followUp = await disputesService.respond(dispute.id, driverUser, {
+        response: 'The diversion was signposted at the Ring Road exit',
+        evidenceUrls: ['https://y/late.jpg'],
+      } as any);
+      expect(followUp.otherPartyResponse).toContain('Route was diverted for roadworks');
+      expect(followUp.otherPartyResponse).toContain('signposted at the Ring Road exit');
+      expect(followUp.otherPartyEvidenceUrls).toContain('https://y/late.jpg');
+
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('both parties may add evidence, and the SLA view reflects both sides', async () => {
+      const { trip, booking, payment } = await disputableBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.WRONG_ROUTE,
+        description: 'opener account',
+      } as any);
+
+      await disputesService.addEvidence(dispute.id, passengerUser, {
+        evidenceUrls: ['https://x/1.jpg', 'https://x/2.jpg'],
+      } as any);
+      // The responding party's evidence lands on their own side of the record
+      const withDriverEvidence = await disputesService.addEvidence(dispute.id, driverUser, {
+        evidenceUrls: ['https://y/0.jpg'],
+      } as any);
+      expect(withDriverEvidence.evidenceUrls).toHaveLength(2);
+      expect(withDriverEvidence.otherPartyEvidenceUrls).toEqual(['https://y/0.jpg']);
+
+      await disputesService.respond(dispute.id, driverUser, {
+        response: 'my side',
+        evidenceUrls: ['https://y/1.jpg'],
+      } as any);
+
+      const sla = await disputesService.getSlaStatus(dispute.id, passengerUser);
+      expect(sla.hasOpenerEvidence).toBe(true);
+      expect(sla.hasOtherPartyResponse).toBe(true);
+      expect(sla.hasOtherPartyEvidence).toBe(true);
+      expect(sla.responseWindowOpen).toBe(true);
+      expect(sla.hoursUntilSlaExpiry).toBeGreaterThan(0);
+
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('a non-party cannot read the dispute', async () => {
+      const { trip, booking, payment } = await disputableBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.OTHER,
+        description: 'x',
+      } as any);
+
+      const stranger = await userRepo.save(
+        userRepo.create({
+          phoneNumber: STRANGER_PHONE,
+          fullName: 'E2E Stranger',
+          status: UserStatus.ACTIVE,
+          role: UserRole.PASSENGER,
+          referralCode: 'E2E_DSP2',
+        }),
+      );
+
+      await expect(disputesService.getDisputeDetail(dispute.id, stranger)).rejects.toThrow();
+      await expect(disputesService.getSlaStatus(dispute.id, stranger)).rejects.toThrow();
+
+      await userRepo.delete(stranger.id);
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('admin assigns then resolves in the passenger favour', async () => {
+      const { trip, booking, payment } = await disputableBooking();
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.NO_SHOW_DRIVER,
+        description: 'driver never arrived',
+      } as any);
+
+      const assigned = await adminService.assignDispute(dispute.id, driverUser.id);
+      expect(assigned.status).toBe(DisputeStatus.UNDER_REVIEW);
+      expect(assigned.assignedAdminId).toBe(driverUser.id);
+
+      const resolved = await adminService.resolveDispute(dispute.id, driverUser.id, {
+        resolution: DisputeStatus.RESOLVED_REFUND,
+        resolutionNotes: 'GPS trail shows no pickup',
+      } as any);
+      await waitForBackground();
+
+      expect(resolved.status).toBe(DisputeStatus.RESOLVED_REFUND);
+      expect(resolved.resolvedAt).not.toBeNull();
+
+      const updatedBooking = await bookingRepo.findOneBy({ id: booking.id });
+      expect(updatedBooking?.status).toBe(BookingStatus.REFUNDED);
+      // The ruling has to reach Kashier, not just the database
+      expect(gw.refund).toHaveBeenCalledWith(payment.gatewayTransactionId, 150, undefined);
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(settled?.status).toBe(PaymentStatus.REFUNDED);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('an already-resolved dispute cannot be resolved again', async () => {
+      const { trip, booking, payment } = await disputableBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+      const notifyManySpy = jest.spyOn(notificationsService, 'sendToUsers').mockResolvedValue(undefined as any);
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.OTHER,
+        description: 'x',
+      } as any);
+      await adminService.resolveDispute(dispute.id, driverUser.id, {
+        resolution: DisputeStatus.RESOLVED_RELEASE,
+        resolutionNotes: 'first',
+      } as any);
+
+      await expect(
+        adminService.resolveDispute(dispute.id, driverUser.id, {
+          resolution: DisputeStatus.RESOLVED_REFUND,
+          resolutionNotes: 'second',
+        } as any),
+      ).rejects.toThrow();
+
+      notifySpy.mockRestore();
+      notifyManySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('SLA expiry auto-refunds a no-show-driver dispute nobody answered', async () => {
+      const { trip, booking, payment } = await disputableBooking();
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.NO_SHOW_DRIVER,
+        description: 'never showed',
+      } as any);
+      // Push the response window into the past
+      await disputeRepo.update(dispute.id, {
+        slaDeadline: new Date(Date.now() - 60 * 60_000),
+      });
+
+      await adminService.handleSlaExpiry();
+
+      const after = await disputeRepo.findOneBy({ id: dispute.id });
+      expect(after?.status).toBe(DisputeStatus.RESOLVED_REFUND);
+      const updatedBooking = await bookingRepo.findOneBy({ id: booking.id });
+      expect(updatedBooking?.status).toBe(BookingStatus.REFUNDED);
+      expect(gw.refund).toHaveBeenCalledWith(payment.gatewayTransactionId, 150, undefined);
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(settled?.status).toBe(PaymentStatus.REFUNDED);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('SLA expiry escalates an ambiguous reason to manual review instead of deciding', async () => {
+      const { trip, booking, payment } = await disputableBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+      const notifyManySpy = jest.spyOn(notificationsService, 'sendToUsers').mockResolvedValue(undefined as any);
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.OTHER,
+        description: 'hard to judge',
+      } as any);
+      await disputeRepo.update(dispute.id, {
+        slaDeadline: new Date(Date.now() - 60 * 60_000),
+      });
+
+      await adminService.handleSlaExpiry();
+
+      const after = await disputeRepo.findOneBy({ id: dispute.id });
+      expect(after?.status).toBe(DisputeStatus.UNDER_REVIEW);
+      // No money decision was taken
+      const updatedBooking = await bookingRepo.findOneBy({ id: booking.id });
+      expect(updatedBooking?.status).toBe(BookingStatus.DISPUTED);
+
+      notifySpy.mockRestore();
+      notifyManySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    // ── Money movement ───────────────────────────────────────────────────────
+    // Regression suite for a resolution path that contained no gateway calls at all: it
+    // wrote REFUNDED / RELEASED onto the payment row and notified both parties that
+    // money had moved when nothing had. RESOLVED_RELEASE was worse than inert — RELEASED
+    // is the label for a *voided* hold, so a driver who won a dispute earned nothing.
+
+    it('a ruling for the driver captures the hold, so the driver is actually paid', async () => {
+      const { trip, booking, payment } = await disputableBooking(PaymentStatus.PENDING);
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(driverUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.NO_SHOW_PASSENGER,
+        description: 'passenger never came',
+      } as any);
+
+      // Baseline with the booking sitting in DISPUTED, which earnings excludes
+      const before = await earningsService.getSummary(driverUser.id);
+
+      await adminService.resolveDispute(dispute.id, driverUser.id, {
+        resolution: DisputeStatus.RESOLVED_RELEASE,
+        resolutionNotes: 'driver waited at the pickup point',
+      } as any);
+
+      expect(gw.capture).toHaveBeenCalledWith(payment.gatewayTransactionId, 150);
+      expect(gw.release).not.toHaveBeenCalled();
+      expect(gw.refund).not.toHaveBeenCalled();
+
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(settled?.status).toBe(PaymentStatus.CAPTURED);
+      expect(settled?.capturedAt).not.toBeNull();
+      expect(settled?.kashierTransactionId).toBe('dispute-cap-1');
+
+      const after = await earningsService.getSummary(driverUser.id);
+      expect(after.allTimeOnline - before.allTimeOnline).toBeCloseTo(139.5, 2);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('a full refund voids an uncaptured hold rather than capturing it first', async () => {
+      const { trip, booking, payment } = await disputableBooking(PaymentStatus.PENDING);
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.NO_SHOW_DRIVER,
+        description: 'driver never arrived',
+      } as any);
+      await adminService.resolveDispute(dispute.id, driverUser.id, {
+        resolution: DisputeStatus.RESOLVED_REFUND,
+        resolutionNotes: 'no pickup on the GPS trail',
+      } as any);
+
+      expect(gw.release).toHaveBeenCalledWith(
+        payment.gatewayTransactionId,
+        payment.kashierTransactionId ?? undefined,
+      );
+      expect(gw.capture).not.toHaveBeenCalled();
+
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(settled?.status).toBe(PaymentStatus.RELEASED);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('a full refund on a captured fare is refunded at the gateway', async () => {
+      const { trip, booking, payment } = await disputableBooking(PaymentStatus.CAPTURED);
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.UNSAFE_DRIVING,
+        description: 'reckless overtaking',
+      } as any);
+      await adminService.resolveDispute(dispute.id, driverUser.id, {
+        resolution: DisputeStatus.RESOLVED_REFUND,
+        resolutionNotes: 'dashcam confirms it',
+      } as any);
+
+      expect(gw.refund).toHaveBeenCalledWith(payment.gatewayTransactionId, 150, undefined);
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(settled?.status).toBe(PaymentStatus.REFUNDED);
+      expect(Number(settled?.refundAmount)).toBeCloseTo(150, 2);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('a split ruling refunds the passenger slice and credits the driver the rest', async () => {
+      const { trip, booking, payment } = await disputableBooking(PaymentStatus.CAPTURED);
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.WRONG_ROUTE,
+        description: 'long detour',
+      } as any);
+      const before = await earningsService.getSummary(driverUser.id);
+
+      await adminService.resolveDispute(dispute.id, driverUser.id, {
+        resolution: DisputeStatus.RESOLVED_SPLIT,
+        resolutionNotes: 'detour was partly avoidable',
+        refundAmount: 50,
+      } as any);
+
+      expect(gw.refund).toHaveBeenCalledWith(payment.gatewayTransactionId, 50, undefined);
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(settled?.status).toBe(PaymentStatus.PARTIALLY_REFUNDED);
+      expect(Number(settled?.refundAmount)).toBeCloseTo(50, 2);
+
+      const updatedBooking = await bookingRepo.findOneBy({ id: booking.id });
+      expect(updatedBooking?.status).toBe(BookingStatus.TRIP_COMPLETED);
+
+      // The driver keeps their payout less what went back to the passenger. A split used
+      // to leave the payment PARTIALLY_REFUNDED, a status earnings ignored entirely, so
+      // the driver was credited nothing for a trip they had mostly won.
+      const after = await earningsService.getSummary(driverUser.id);
+      expect(after.allTimeOnline - before.allTimeOnline).toBeCloseTo(89.5, 2);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('a split on an uncaptured hold captures the fare first, then returns the slice', async () => {
+      const { trip, booking, payment } = await disputableBooking(PaymentStatus.PENDING);
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.WRONG_ROUTE,
+        description: 'detour',
+      } as any);
+      await adminService.resolveDispute(dispute.id, driverUser.id, {
+        resolution: DisputeStatus.RESOLVED_SPLIT,
+        resolutionNotes: 'both at fault',
+        refundAmount: 40,
+      } as any);
+
+      expect(gw.capture).toHaveBeenCalledWith(payment.gatewayTransactionId, 150);
+      // Refunds the capture we just made rather than letting Kashier pick a transaction
+      expect(gw.refund).toHaveBeenCalledWith(payment.gatewayTransactionId, 40, 'dispute-cap-1');
+
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(settled?.status).toBe(PaymentStatus.PARTIALLY_REFUNDED);
+      expect(Number(settled?.refundAmount)).toBeCloseTo(40, 2);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('rejects a split with no slice, or one larger than the fare', async () => {
+      const { trip, booking, payment } = await disputableBooking(PaymentStatus.CAPTURED);
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.OTHER,
+        description: 'x',
+      } as any);
+
+      await expect(
+        adminService.resolveDispute(dispute.id, driverUser.id, {
+          resolution: DisputeStatus.RESOLVED_SPLIT,
+          resolutionNotes: 'no amount given',
+        } as any),
+      ).rejects.toThrow();
+
+      await expect(
+        adminService.resolveDispute(dispute.id, driverUser.id, {
+          resolution: DisputeStatus.RESOLVED_SPLIT,
+          resolutionNotes: 'more than was paid',
+          refundAmount: 500,
+        } as any),
+      ).rejects.toThrow();
+
+      expect(gw.refund).not.toHaveBeenCalled();
+      // The dispute is still open for a valid decision
+      const still = await disputeRepo.findOneBy({ id: dispute.id });
+      expect(still?.status).toBe(DisputeStatus.OPEN);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('a cash fare is settled between the parties, with no gateway call', async () => {
+      const { trip, booking, payment } = await disputableBooking(
+        PaymentStatus.PENDING,
+        PaymentMethod.CASH,
+      );
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.NO_SHOW_DRIVER,
+        description: 'never arrived',
+      } as any);
+      await adminService.resolveDispute(dispute.id, driverUser.id, {
+        resolution: DisputeStatus.RESOLVED_REFUND,
+        resolutionNotes: 'refund owed in cash',
+      } as any);
+      await waitForBackground();
+
+      expect(gw.capture).not.toHaveBeenCalled();
+      expect(gw.refund).not.toHaveBeenCalled();
+      expect(gw.release).not.toHaveBeenCalled();
+
+      // Booking records the ruling; the payment row is untouched because no card money exists
+      const updatedBooking = await bookingRepo.findOneBy({ id: booking.id });
+      expect(updatedBooking?.status).toBe(BookingStatus.REFUNDED);
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(settled?.status).toBe(PaymentStatus.PENDING);
+
+      // Both parties are told the money moves between them, not through the gateway
+      const bodies = gw.notifyMany.mock.calls.map(([, msg]) => (msg as any).body);
+      expect(bodies.some((b) => String(b).includes('النقدي'))).toBe(true);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('a gateway failure still records the ruling and leaves the payment reconcilable', async () => {
+      const { trip, booking, payment } = await disputableBooking(PaymentStatus.PENDING);
+      const gw = spyOnGateway();
+      gw.capture.mockRejectedValue(new Error('Kashier unavailable'));
+
+      const dispute = await bookingsService.openDispute(driverUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.NO_SHOW_PASSENGER,
+        description: 'no show',
+      } as any);
+
+      // The admin's decision must not fail because Kashier is down
+      const resolved = await adminService.resolveDispute(dispute.id, driverUser.id, {
+        resolution: DisputeStatus.RESOLVED_RELEASE,
+        resolutionNotes: 'driver waited',
+      } as any);
+      expect(resolved.status).toBe(DisputeStatus.RESOLVED_RELEASE);
+
+      const updatedBooking = await bookingRepo.findOneBy({ id: booking.id });
+      expect(updatedBooking?.status).toBe(BookingStatus.TRIP_COMPLETED);
+
+      // Still PENDING, not falsely CAPTURED — this is exactly the state the capture
+      // reconciliation job looks for, so the money is collected on a later pass.
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(settled?.status).toBe(PaymentStatus.PENDING);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('SLA auto-release captures the fare instead of only labelling it', async () => {
+      const { trip, booking, payment } = await disputableBooking(PaymentStatus.PENDING);
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(driverUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.NO_SHOW_PASSENGER,
+        description: 'no show',
+      } as any);
+      await disputeRepo.update(dispute.id, {
+        slaDeadline: new Date(Date.now() - 60 * 60_000),
+      });
+
+      await adminService.handleSlaExpiry();
+
+      expect(gw.capture).toHaveBeenCalledWith(payment.gatewayTransactionId, 150);
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(settled?.status).toBe(PaymentStatus.CAPTURED);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('SLA auto-refund voids the hold at the gateway', async () => {
+      const { trip, booking, payment } = await disputableBooking(PaymentStatus.PENDING);
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.NO_SHOW_DRIVER,
+        description: 'never arrived',
+      } as any);
+      await disputeRepo.update(dispute.id, {
+        slaDeadline: new Date(Date.now() - 60 * 60_000),
+      });
+
+      await adminService.handleSlaExpiry();
+
+      expect(gw.release).toHaveBeenCalled();
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(settled?.status).toBe(PaymentStatus.RELEASED);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    // ── Windows, deadlines and limits ────────────────────────────────────────
+
+    it('refuses a dispute opened after the window has closed, and honours a wider window', async () => {
+      const configRepo = dataSource.getRepository(PlatformConfig);
+      const original = await configRepo.findOneBy({ key: CONFIG_KEYS.DISPUTE_WINDOW_HOURS });
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+
+      // A trip that ran four days ago, well past the 48-hour default
+      const trip = await makeTrip({
+        status: TripStatus.COMPLETED,
+        departureTime: new Date(Date.now() - 96 * 3_600_000),
+      });
+      const { booking, payment } = await makeBookingWithPayment(trip.id, {
+        bookingStatus: BookingStatus.TRIP_COMPLETED,
+        paymentStatus: PaymentStatus.CAPTURED,
+      });
+      await bookingRepo.update(booking.id, {
+        completedAt: new Date(Date.now() - 96 * 3_600_000),
+      });
+
+      await expect(
+        bookingsService.openDispute(passengerUser, {
+          bookingId: booking.id,
+          reason: DisputeReason.WRONG_ROUTE,
+          description: 'remembered it late',
+        } as any),
+      ).rejects.toThrow(/within 48 hours/);
+
+      // The window is admin-configurable, and the same booking becomes disputable
+      await configRepo.update({ key: CONFIG_KEYS.DISPUTE_WINDOW_HOURS }, { value: '240' });
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.WRONG_ROUTE,
+        description: 'remembered it late',
+      } as any);
+      expect(dispute.status).toBe(DisputeStatus.OPEN);
+
+      if (original) {
+        await configRepo.update({ key: CONFIG_KEYS.DISPUTE_WINDOW_HOURS }, { value: original.value });
+      }
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('takes the response deadline from config rather than a hardcoded 48 hours', async () => {
+      const configRepo = dataSource.getRepository(PlatformConfig);
+      const original = await configRepo.findOneBy({ key: CONFIG_KEYS.DISPUTE_SLA_HOURS });
+      await configRepo.update({ key: CONFIG_KEYS.DISPUTE_SLA_HOURS }, { value: '6' });
+
+      const { trip, booking, payment } = await disputableBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.OTHER,
+        description: 'x',
+      } as any);
+      await waitForBackground();
+
+      const hours = (dispute.slaDeadline!.getTime() - Date.now()) / 3_600_000;
+      expect(hours).toBeGreaterThan(5.5);
+      expect(hours).toBeLessThan(6.5);
+
+      // The other party is told the real deadline, not a stale 48
+      const bodies = notifySpy.mock.calls.map(([, msg]) => (msg as any).body);
+      expect(bodies.some((b) => String(b).includes('6'))).toBe(true);
+
+      if (original) {
+        await configRepo.update({ key: CONFIG_KEYS.DISPUTE_SLA_HOURS }, { value: original.value });
+      }
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('rejects evidence past the cap instead of silently dropping it', async () => {
+      const { trip, booking, payment } = await disputableBooking();
+      const notifySpy = jest.spyOn(notificationsService, 'sendToUser').mockResolvedValue(undefined as any);
+      const urls = (n: number, p: string) =>
+        Array.from({ length: n }, (_, i) => `https://${p}/${i}.jpg`);
+
+      // Too many at the door
+      await expect(
+        bookingsService.openDispute(passengerUser, {
+          bookingId: booking.id,
+          reason: DisputeReason.OTHER,
+          description: 'x',
+          evidenceUrls: urls(11, 'open'),
+        } as any),
+      ).rejects.toThrow(/at most 10/);
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.OTHER,
+        description: 'x',
+        evidenceUrls: urls(9, 'open'),
+      } as any);
+
+      // One more fits; the second push would overflow and is refused whole
+      await disputesService.addEvidence(dispute.id, passengerUser, {
+        evidenceUrls: urls(1, 'extra'),
+      } as any);
+      await expect(
+        disputesService.addEvidence(dispute.id, passengerUser, {
+          evidenceUrls: urls(1, 'overflow'),
+        } as any),
+      ).rejects.toThrow(/at most 10/);
+
+      const stored = await disputeRepo.findOneBy({ id: dispute.id });
+      expect(stored?.evidenceUrls).toHaveLength(10);
+
+      notifySpy.mockRestore();
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+  });
+
   // ── 22. Promo credit integrity ───────────────────────────────────────────────
   // Regression: the balance was read without a lock before being decremented, so two
   // simultaneous bookings could spend the same credit; and a failed checkout returned
@@ -3168,6 +3910,9 @@ describe('Features E2E', () => {
       expect(policy.lateCancelFeePct).toBeLessThan(1);
       // The tiers have to be ordered or the displayed policy is nonsense
       expect(policy.freeCancelHours).toBeGreaterThan(policy.lateCancelHours);
+      // The dispute screens read their deadlines from here for the same reason
+      expect(policy.disputeWindowHours).toBeGreaterThan(0);
+      expect(policy.disputeSlaHours).toBeGreaterThan(0);
     });
 
     // Regression: the detail endpoint returned the whole driver entity

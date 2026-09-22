@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import '../../../../shared/widgets/app_button.dart';
+import '../../../bookings/providers/bookings_provider.dart';
 import '../../providers/disputes_provider.dart';
 
 const _passengerReasons = [
@@ -68,6 +69,11 @@ class _OpenDisputeScreenState extends ConsumerState<OpenDisputeScreen> {
     if (state is AsyncError) apiError = state.error.toString();
 
     final isDriver = widget.role == 'driver';
+    // Both deadlines are admin-configurable, so the notice quotes what the backend will
+    // actually enforce. Falls back to the defaults while the request is in flight.
+    final policy = ref.watch(cancellationPolicyProvider).valueOrNull;
+    final windowHours = (policy?.disputeWindowHours ?? 48).round();
+    final slaHours = (policy?.disputeSlaHours ?? 48).round();
 
     return Scaffold(
       appBar: AppBar(
@@ -92,8 +98,8 @@ class _OpenDisputeScreenState extends ConsumerState<OpenDisputeScreen> {
                       Expanded(
                         child: Text(
                           isDriver
-                              ? 'سيتم إخطار الراكب وسيُراجع فريق يلا نسافر طلبك خلال 48 ساعة.'
-                              : 'يمكن فتح النزاع خلال 48 ساعة من انتهاء الرحلة. سيُراجع فريق يلا نسافر طلبك وسيُبلَّغ السائق.',
+                              ? 'سيتم إخطار الراكب وأمامه $slaHours ساعة للرد، ثم يُراجع فريق يلا نسافر طلبك.'
+                              : 'يمكن فتح النزاع خلال $windowHours ساعة من انتهاء الرحلة، وأمام السائق $slaHours ساعة للرد. سيُراجع فريق يلا نسافر طلبك.',
                           style: const TextStyle(fontSize: 13),
                         ),
                       ),

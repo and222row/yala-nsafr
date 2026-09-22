@@ -21,6 +21,7 @@ class _AdminConfigScreenState extends ConsumerState<AdminConfigScreen> {
   final _commissionCtrl = TextEditingController();
   final _autoConfirmCtrl = TextEditingController();
   final _disputeWindowCtrl = TextEditingController();
+  final _disputeSlaCtrl = TextEditingController();
   final _ratingRevealCtrl = TextEditingController();
 
   bool _saving = false;
@@ -33,6 +34,7 @@ class _AdminConfigScreenState extends ConsumerState<AdminConfigScreen> {
     _commissionCtrl.dispose();
     _autoConfirmCtrl.dispose();
     _disputeWindowCtrl.dispose();
+    _disputeSlaCtrl.dispose();
     _ratingRevealCtrl.dispose();
     super.dispose();
   }
@@ -46,6 +48,7 @@ class _AdminConfigScreenState extends ConsumerState<AdminConfigScreen> {
     _autoConfirmCtrl.text = config['auto_confirm_hours']?.toString() ?? '2';
     _disputeWindowCtrl.text =
         config['dispute_window_hours']?.toString() ?? '48';
+    _disputeSlaCtrl.text = config['dispute_sla_hours']?.toString() ?? '48';
     _ratingRevealCtrl.text =
         config['rating_reveal_days']?.toString() ?? '7';
   }
@@ -60,6 +63,7 @@ class _AdminConfigScreenState extends ConsumerState<AdminConfigScreen> {
       final commission = double.tryParse(_commissionCtrl.text);
       final autoConfirm = int.tryParse(_autoConfirmCtrl.text);
       final disputeWindow = int.tryParse(_disputeWindowCtrl.text);
+      final disputeSla = int.tryParse(_disputeSlaCtrl.text);
       final ratingReveal = int.tryParse(_ratingRevealCtrl.text);
 
       if (commission == null || commission < 0 || commission > 50) {
@@ -69,6 +73,7 @@ class _AdminConfigScreenState extends ConsumerState<AdminConfigScreen> {
       await ref.read(dioProvider).patch('/admin/config', data: {
         if (autoConfirm != null) 'autoConfirmHours': autoConfirm,
         if (disputeWindow != null) 'disputeWindowHours': disputeWindow,
+        if (disputeSla != null) 'disputeSlaHours': disputeSla,
         if (ratingReveal != null) 'ratingRevealDays': ratingReveal,
         'commissionRate': commission / 100,
       });
@@ -121,6 +126,14 @@ class _AdminConfigScreenState extends ConsumerState<AdminConfigScreen> {
                   label: 'نافذة النزاع (ساعة)',
                   hint: 'المدة المسموح فيها بفتح نزاع',
                   icon: Icons.gavel_rounded,
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 12),
+                _Field(
+                  ctrl: _disputeSlaCtrl,
+                  label: 'مهلة الرد على النزاع (ساعة)',
+                  hint: 'المدة المتاحة للطرف الآخر للرد قبل الحسم التلقائي',
+                  icon: Icons.timer_rounded,
                   keyboardType: TextInputType.number,
                 ),
                 const SizedBox(height: 12),
