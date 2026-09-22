@@ -62,9 +62,13 @@ export class EarningsService {
       const isThisMonth = completionDate && new Date(completionDate) >= startOfMonth;
 
       if (isCash) {
-        // Cash is collected by the driver directly, so completion is enough
-        allTimeCash += total;
-        if (isThisMonth) thisMonthCash += total;
+        // Cash is collected by the driver directly, so completion is enough — less
+        // anything a dispute ruling sent back to the passenger. There is no gateway to
+        // claw that through, so the driver hands it over themselves; counting the full
+        // fare would show them cash they have been told to return.
+        const kept = Math.max(0, +(total - Number(b.payment?.refundAmount ?? 0)).toFixed(2));
+        allTimeCash += kept;
+        if (isThisMonth) thisMonthCash += kept;
       } else if (b.payment?.status === PaymentStatus.CAPTURED) {
         // Only credit online payouts once the money is actually captured. A completed
         // trip whose capture failed or whose authorization lapsed collected nothing,

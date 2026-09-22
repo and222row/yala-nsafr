@@ -21,6 +21,7 @@ import { SubscriptionsModule } from './modules/subscriptions/subscriptions.modul
 import { BlocksModule } from './modules/blocks/blocks.module';
 import { SchedulerModule } from './modules/scheduler/scheduler.module';
 import { SosModule } from './modules/sos/sos.module';
+import { HealthController } from './health.controller';
 
 @Module({
   imports: [
@@ -52,5 +53,6 @@ import { SosModule } from './modules/sos/sos.module';
     SchedulerModule,
     SosModule,
   ],
+  controllers: [HealthController],
 })
 export class AppModule {}

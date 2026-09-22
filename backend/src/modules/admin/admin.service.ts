@@ -403,6 +403,24 @@ export class AdminService implements OnModuleInit {
       // would roll the record back while the passenger's money had already moved.
       settlement = this.planDisputeSettlement(payment, isCash, dto.resolution, refund);
 
+      // Cash never reaches Kashier, but the ruling still has to be recorded: the driver
+      // is holding money a refund or split says belongs to the passenger. Safe to write
+      // in the transaction precisely because no gateway call can fail underneath it.
+      // Earnings reads this so a driver is not shown cash they have been told to return.
+      if (isCash && payment) {
+        const owedBack =
+          dto.resolution === DisputeStatus.RESOLVED_REFUND
+            ? Number(payment.amount)
+            : dto.resolution === DisputeStatus.RESOLVED_SPLIT
+              ? refund
+              : 0;
+        if (owedBack > 0) {
+          payment.refundAmount = owedBack;
+          payment.refundedAt = new Date();
+          await manager.save(Payment, payment);
+        }
+      }
+
       // Only the booking is advanced here. The payment row is moved by the settlement
       // step as each gateway call succeeds, so a Kashier outage leaves a completed
       // booking with a still-PENDING payment — which reconciliation picks up — rather
@@ -557,6 +575,14 @@ export class AdminService implements OnModuleInit {
           // payment and never called Kashier at all, so the passenger was told their
           // money was on the way while the authorization quietly expired.
           settlement = this.planDisputeSettlement(booking.payment, isCash, resolution, 0);
+
+          // Same bookkeeping as a manual ruling: a cash fare the passenger is owed back
+          // is recorded on the payment so earnings stop counting it as the driver's.
+          if (isCash && booking.payment && resolution === DisputeStatus.RESOLVED_REFUND) {
+            booking.payment.refundAmount = Number(booking.payment.amount);
+            booking.payment.refundedAt = new Date();
+            await manager.save(Payment, booking.payment);
+          }
 
           await manager.save(Booking, booking);
 

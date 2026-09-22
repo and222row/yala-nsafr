@@ -3290,8 +3290,9 @@ describe('Features E2E', () => {
     });
 
     it('a cash fare is settled between the parties, with no gateway call', async () => {
+      // Cash bookings are created CAPTURED — the driver collects the fare in person
       const { trip, booking, payment } = await disputableBooking(
-        PaymentStatus.PENDING,
+        PaymentStatus.CAPTURED,
         PaymentMethod.CASH,
       );
       const gw = spyOnGateway();
@@ -3311,15 +3312,52 @@ describe('Features E2E', () => {
       expect(gw.refund).not.toHaveBeenCalled();
       expect(gw.release).not.toHaveBeenCalled();
 
-      // Booking records the ruling; the payment row is untouched because no card money exists
       const updatedBooking = await bookingRepo.findOneBy({ id: booking.id });
       expect(updatedBooking?.status).toBe(BookingStatus.REFUNDED);
+
+      // The cash really was collected, so the status stands; what the ruling sends back
+      // is recorded as the amount owed rather than faked as a gateway refund.
       const settled = await paymentRepo.findOneBy({ id: payment.id });
-      expect(settled?.status).toBe(PaymentStatus.PENDING);
+      expect(settled?.status).toBe(PaymentStatus.CAPTURED);
+      expect(Number(settled?.refundAmount)).toBeCloseTo(150, 2);
 
       // Both parties are told the money moves between them, not through the gateway
       const bodies = gw.notifyMany.mock.calls.map(([, msg]) => (msg as any).body);
       expect(bodies.some((b) => String(b).includes('النقدي'))).toBe(true);
+
+      await cleanup(trip.id, booking.id, payment.id);
+    });
+
+    it('a cash split takes the returned slice off the driver’s cash earnings', async () => {
+      const { trip, booking, payment } = await disputableBooking(
+        PaymentStatus.CAPTURED,
+        PaymentMethod.CASH,
+      );
+      const gw = spyOnGateway();
+
+      const dispute = await bookingsService.openDispute(passengerUser, {
+        bookingId: booking.id,
+        reason: DisputeReason.WRONG_ROUTE,
+        description: 'long detour',
+      } as any);
+      const before = await earningsService.getSummary(driverUser.id);
+
+      await adminService.resolveDispute(dispute.id, driverUser.id, {
+        resolution: DisputeStatus.RESOLVED_SPLIT,
+        resolutionNotes: 'hand back a third of the fare',
+        refundAmount: 50,
+      } as any);
+
+      expect(gw.refund).not.toHaveBeenCalled();
+      const settled = await paymentRepo.findOneBy({ id: payment.id });
+      expect(Number(settled?.refundAmount)).toBeCloseTo(50, 2);
+
+      // The driver keeps 100 of the 150 they collected. Counting the full fare would show
+      // them cash the ruling told them to hand back.
+      const after = await earningsService.getSummary(driverUser.id);
+      expect(after.allTimeCash - before.allTimeCash).toBeCloseTo(100, 2);
+      // Cash never feeds the withdrawable balance, so nothing moves there
+      expect(after.pendingBalance).toBeCloseTo(before.pendingBalance, 2);
 
       await cleanup(trip.id, booking.id, payment.id);
     });
